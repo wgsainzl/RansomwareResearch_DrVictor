@@ -174,8 +174,8 @@ def extract_features(raw: pd.DataFrame):
         time_rows.append(trow)
         freq_rows.append(frow)
 
-    time_df = pd.Frame(time_rows)
-    freq_df = pd.Frame(freq_rows)
+    time_df = pd.DataFrame(time_rows)
+    freq_df = pd.DataFrame(freq_rows)
 
     key = ["pid", "class", "window", "start_s"]
     hybrid_df = time_df.merge(freq_df, on=key, how="inner")
