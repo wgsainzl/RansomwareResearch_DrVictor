@@ -197,8 +197,8 @@ def plot_raw_examples(raw):
     for label in CLASSES:
         pid = raw.loc[raw["class"] == label, "pid"].iloc[0]
         g = raw[raw["pid"] == pid]
-        ax.plot(g["time_s"], g["CPI"], label=f"{label} (PID {pid})", linewidth=1.2)
-    ax.set_title("Synthetic per-PID CPI time series")
+        ax.plot(g["time_s"], g["CPI"], label=f"{label} (run {pid})", linewidth=1.2)
+    ax.set_title("PCM CPI time series (System)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("CPI")
     ax.legend()
@@ -209,8 +209,8 @@ def plot_raw_examples(raw):
     for label in CLASSES:
         pid = raw.loc[raw["class"] == label, "pid"].iloc[0]
         g = raw[raw["pid"] == pid]
-        ax.plot(g["time_s"], g["LLC_MPKI"], label=f"{label} (PID {pid})", linewidth=1.2)
-    ax.set_title("Synthetic per-PID LLC MPKI time series")
+        ax.plot(g["time_s"], g["LLC_MPKI"], label=f"{label} (run {pid})", linewidth=1.2)
+    ax.set_title("PCM LLC MPKI time series (System)")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("LLC MPKI")
     ax.legend()
@@ -219,7 +219,7 @@ def plot_raw_examples(raw):
 
 
 def plot_window_example(raw):
-    label = "ransomware_like"
+    label = "cryptsky"
     pid = raw.loc[raw["class"] == label, "pid"].iloc[0]
     g = raw[raw["pid"] == pid].sort_values("time_s").reset_index(drop=True)
     win = g.iloc[:WINDOW_N]
@@ -302,8 +302,15 @@ def pca_plot(df, title, filename):
     fig, ax = plt.subplots(figsize=(8, 6))
     for label in CLASSES:
         m = pca_df["class"] == label
+        if not m.any():
+            continue
+        is_rw = (label == "cryptsky")
         ax.scatter(pca_df.loc[m, "PC1"], pca_df.loc[m, "PC2"],
-                   label=label, alpha=0.75, s=35)
+                   label=label,
+                   marker="X" if is_rw else "o",
+                   s=120 if is_rw else 35,
+                   edgecolors="black" if is_rw else "none",
+                   alpha=0.9 if is_rw else 0.6)
 
     evr = pca.explained_variance_ratio_ * 100
     ax.set_title(title)
@@ -338,9 +345,9 @@ def plot_explained_variance(df, title, filename):
 # Main
 # ---------------------------------------------------------------------
 def main():
-    print("Generating synthetic PCM-like telemetry...")
-    raw = _set()
-    raw.to_csv(OUT / "synthetic_pcm_telemetry.csv", index=False)
+    print("Loading PCM telemetry...")
+    raw = load_pcm_dataset()
+    raw.to_csv(OUT / "pcm_telemetry.csv", index=False)
 
     print("Extracting window features...")
     time_df, freq_df, hybrid_df = extract_features(raw)
@@ -378,7 +385,6 @@ def main():
     )
 
     print(f"\nDone. Outputs written to: {OUT.resolve()}")
-    print("Important: synthetic classes are educational, not measured ransomware signatures.")
 
 
 if __name__ == "__main__":
