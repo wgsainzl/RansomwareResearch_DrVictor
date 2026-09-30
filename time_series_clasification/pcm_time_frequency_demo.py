@@ -31,92 +31,71 @@ RNG = np.random.default_rng(42)
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-FS = 20.0                 # samples/second
-DURATION_S = 60           # seconds per synthetic PID
+DATA_DIR = Path.home() / "Desktop" / "Resultados_ALL"
+
+FS = 2.0                 # samples/second
+#DURATION_S = 60           # seconds per synthetic PID
 WINDOW_S = 5              # seconds/window
 WINDOW_N = int(FS * WINDOW_S)
-N_PIDS_PER_CLASS = 5
+#N_PIDS_PER_CLASS = 5
 
-METRICS = ["CPI", "IPC", "LLC_MPKI", "BRANCH_MPKI"]
-CLASSES = ["web", "database", "compression", "ransomware_like"]
+METRICS = ["CPI", "IPC", "LLC_MPKI"]
+CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "cryptsky"]
 
 OUT = Path("pcm_demo_output")
 OUT.mkdir(exist_ok=True)
 
 
 # ---------------------------------------------------------------------
-# Synthetic telemetry
+# PCM telemetry loader
 # ---------------------------------------------------------------------
-def generate_pid_trace(label: str, pid: int) -> pd.DataFrame:
-    """
-    Generate one synthetic PID trace.
+def load_pcm_csv(path: Path, label: str, run_id: int) -> pd.DataFrame:
+    """Lee un CSV de pcm (2 filas de encabezado) y devuelve el formato largo."""
+    df = pd.read_csv(path, header=[0, 1])
+    sysd = df["System"]
 
-    The formulas intentionally create different combinations of:
-      - average level
-      - variance
-      - periodicity
-      - noise
+    def col(name):
+        return pd.to_numeric(sysd[name], errors="coerce")
 
-    They are chosen for teaching/visualization only.
-    """
-    n = int(FS * DURATION_S)
-    t = np.arange(n) / FS
-
-    phase1, phase2 = RNG.uniform(0, 2*np.pi, size=2)
-
-    if label == "web":
-        cpi = 1.05 + 0.05*np.sin(2*np.pi*0.35*t + phase1) + RNG.normal(0, 0.08, n)
-        llc = 3.2 + 0.30*np.sin(2*np.pi*0.20*t + phase2) + RNG.normal(0, 0.35, n)
-        branch = 2.0 + RNG.normal(0, 0.18, n)
-
-    elif label == "database":
-        cpi = 1.45 + 0.12*np.sin(2*np.pi*0.18*t + phase1) + RNG.normal(0, 0.10, n)
-        llc = 10.5 + 1.0*np.sin(2*np.pi*0.25*t + phase2) + RNG.normal(0, 0.65, n)
-        branch = 1.35 + RNG.normal(0, 0.14, n)
-
-    elif label == "compression":
-        cpi = 0.88 + 0.13*np.sin(2*np.pi*1.2*t + phase1) + RNG.normal(0, 0.07, n)
-        llc = 5.5 + 0.45*np.sin(2*np.pi*1.2*t + phase2) + RNG.normal(0, 0.32, n)
-        branch = 2.6 + 0.25*np.sin(2*np.pi*0.8*t) + RNG.normal(0, 0.13, n)
-
-    elif label == "ransomware_like":
-        # Deliberately repetitive synthetic pattern for demonstrating
-        # how frequency-domain features can expose periodic structure.
-        cpi = 0.92 + 0.18*np.sin(2*np.pi*2.0*t + phase1) + RNG.normal(0, 0.06, n)
-        llc = 5.8 + 0.65*np.sin(2*np.pi*2.0*t + phase2) + RNG.normal(0, 0.28, n)
-        branch = 1.0 + 0.12*np.sin(2*np.pi*2.0*t) + RNG.normal(0, 0.10, n)
-
-    else:
-        raise ValueError(label)
-
-    # IPC is approximately reciprocal to CPI, with measurement noise.
-    ipc = 1.0 / np.clip(cpi, 0.2, None) + RNG.normal(0, 0.025, n)
-
-    return pd.DataFrame({
-        "time_s": t,
-        "pid": pid,
-        "class": label,
-        "CPI": cpi,
+    ipc = col("IPC")
+    out = pd.DataFrame({
         "IPC": ipc,
-        "LLC_MPKI": np.clip(llc, 0, None),
-        "BRANCH_MPKI": np.clip(branch, 0, None),
+        "CPI": 1.0 / ipc.where(ipc > 0),
+        "LLC_MPKI": col("L3MPI") * 1000.0,
+        "L2_MPKI": col("L2MPI") * 1000.0,
     })
 
+    # Rellenar huecos (NaN/inf) interpolando para no romper el espaciado temporal
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.interpolate(limit_direction="both")
 
-def make_dataset() -> pd.DataFrame:
+    out.insert(0, "time_s", np.arange(len(out)) / FS)
+    out.insert(1, "pid", run_id)          # "pid" = id de corrida
+    out.insert(2, "class", label)
+    out["run_file"] = path.name
+    return out
+
+
+def load_pcm_dataset() -> pd.DataFrame:
     frames = []
-    pid = 1000
+    run_id = 1000
     for label in CLASSES:
-        for _ in range(N_PIDS_PER_CLASS):
-            frames.append(generate_pid_trace(label, pid))
-            pid += 1
+        files = sorted((DATA_DIR / label).glob("*pcm*.csv"))
+        if not files:
+            print(f"[aviso] sin CSV para '{label}' en {DATA_DIR / label}")
+            continue
+        for f in files:
+            d = load_pcm_csv(f, label, run_id)
+            if len(d) < WINDOW_N:
+                print(f"[aviso] {f.name}: {len(d)} muestras (< {WINDOW_N}), se omite")
+                continue
+            frames.append(d)
+            run_id += 1
     return pd.concat(frames, ignore_index=True)
-
-
 # ---------------------------------------------------------------------
 # Windowing and feature extraction
 # ---------------------------------------------------------------------
-def iter_windows(df: pd.DataFrame):
+def iter_windows(df: pd.Frame):
     for (pid, label), g in df.groupby(["pid", "class"], sort=False):
         g = g.sort_values("time_s").reset_index(drop=True)
         n_windows = len(g) // WINDOW_N
@@ -165,7 +144,7 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
     }
 
 
-def extract_features(raw: pd.DataFrame):
+def extract_features(raw: pd.Frame):
     time_rows = []
     freq_rows = []
 
@@ -195,8 +174,8 @@ def extract_features(raw: pd.DataFrame):
         time_rows.append(trow)
         freq_rows.append(frow)
 
-    time_df = pd.DataFrame(time_rows)
-    freq_df = pd.DataFrame(freq_rows)
+    time_df = pd.Frame(time_rows)
+    freq_df = pd.Frame(freq_rows)
 
     key = ["pid", "class", "window", "start_s"]
     hybrid_df = time_df.merge(freq_df, on=key, how="inner")
@@ -360,7 +339,7 @@ def plot_explained_variance(df, title, filename):
 # ---------------------------------------------------------------------
 def main():
     print("Generating synthetic PCM-like telemetry...")
-    raw = make_dataset()
+    raw = _set()
     raw.to_csv(OUT / "synthetic_pcm_telemetry.csv", index=False)
 
     print("Extracting window features...")
