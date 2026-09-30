@@ -95,7 +95,7 @@ def load_pcm_dataset() -> pd.DataFrame:
 # ---------------------------------------------------------------------
 # Windowing and feature extraction
 # ---------------------------------------------------------------------
-def iter_windows(df: pd.Frame):
+def iter_windows(df: pd.DataFrame):
     for (pid, label), g in df.groupby(["pid", "class"], sort=False):
         g = g.sort_values("time_s").reset_index(drop=True)
         n_windows = len(g) // WINDOW_N
@@ -144,7 +144,7 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
     }
 
 
-def extract_features(raw: pd.Frame):
+def extract_features(raw: pd.DataFrame):
     time_rows = []
     freq_rows = []
 
