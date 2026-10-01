@@ -42,6 +42,7 @@ WINDOW_N = int(FS * WINDOW_S)
 METRICS = ["CPI", "IPC", "LLC_MPKI"]
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "cryptsky"]
 
+
 OUT = Path("pcm_demo_output")
 OUT.mkdir(exist_ok=True)
 
@@ -61,8 +62,8 @@ def load_pcm_csv(path: Path, label: str, run_id: int) -> pd.DataFrame:
     out = pd.DataFrame({
         "IPC": ipc,
         "CPI": 1.0 / ipc.where(ipc > 0),
-        "LLC_MPKI": col("L3MPI") * 1000.0,
-        "L2_MPKI": col("L2MPI") * 1000.0,
+        "LLC_MPKI": col("L3MISS") / col("INST") * 1000.0,
+        "L2_MPKI": col("L2MISS") / col("INST") * 1000.0,
     })
 
     # Rellenar huecos (NaN/inf) interpolando para no romper el espaciado temporal
