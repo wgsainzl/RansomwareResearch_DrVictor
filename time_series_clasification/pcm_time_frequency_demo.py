@@ -229,7 +229,7 @@ def plot_window_example(raw):
     ax.plot(win["time_s"], win["CPI"], marker="o", markersize=2)
     ax.axhline(win["CPI"].mean(), linestyle="--",
                label=f"mean={win['CPI'].mean():.3f}")
-    ax.set_title(f"One {WINDOW_S}-second CPI window — PID {pid}")
+    ax.set_title(f"One {WINDOW_S}-second CPI window — {label} (run {pid})")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("CPI")
     ax.legend()
