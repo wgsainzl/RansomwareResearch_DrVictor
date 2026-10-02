@@ -241,7 +241,7 @@ def plot_same_mean_different_structure():
     # Similar mean/std, different organization in time.
     n = WINDOW_N
     t = np.arange(n) / FS
-    a = 1.0 + 0.18*np.sin(2*np.pi*2.0*t)
+    a = 1.0 + 0.18*np.sin(2*np.pi*0.4*t)
     b = 1.0 + RNG.normal(0, np.std(a), n)
 
     fig, ax = plt.subplots(figsize=(10, 4.5))
