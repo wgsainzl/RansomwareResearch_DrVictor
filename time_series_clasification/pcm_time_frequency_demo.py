@@ -33,7 +33,7 @@ RNG = np.random.default_rng(42)
 # ---------------------------------------------------------------------
 DATA_DIR = Path.home() / "Desktop" / "Resultados_ALL"
 
-FS = 2.0                 # samples/second
+FS = 10.0                 # samples/second
 #DURATION_S = 60           # seconds per synthetic PID
 WINDOW_S = 5              # seconds/window
 WINDOW_N = int(FS * WINDOW_S)
