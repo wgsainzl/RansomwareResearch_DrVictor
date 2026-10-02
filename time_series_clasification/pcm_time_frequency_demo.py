@@ -40,7 +40,7 @@ WINDOW_N = int(FS * WINDOW_S)
 #N_PIDS_PER_CLASS = 5
 
 METRICS = ["CPI", "IPC", "LLC_MPKI"]
-CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "cryptsky"]
+CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "mlc", "cryptsky"]
 
 
 OUT = Path("pcm_demo_output")
