@@ -35,7 +35,7 @@ DATA_DIR = Path.home() / "Desktop" / "Resultados_ALL"
 
 FS = 10.0                 # samples/second
 #DURATION_S = 60           # seconds per synthetic PID
-WINDOW_S = 5              # seconds/window
+WINDOW_S = 10              # seconds/window
 WINDOW_N = int(FS * WINDOW_S)
 #N_PIDS_PER_CLASS = 5
 
