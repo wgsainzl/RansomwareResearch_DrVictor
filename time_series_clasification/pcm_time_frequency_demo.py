@@ -24,6 +24,10 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import (confusion_matrix, precision_score, f1_score,
+                             adjusted_rand_score, silhouette_score, roc_auc_score)
+from scipy.optimize import linear_sum_assignment
 
 
 RNG = np.random.default_rng(42)
@@ -39,7 +43,7 @@ WINDOW_S = 20              # seconds/window
 WINDOW_N = int(FS * WINDOW_S)
 #N_PIDS_PER_CLASS = 5
 
-METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
+METRICS = ["CPI", "IPC", "LLC_MPKI"]
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "mlc", "cryptsky"]
 
 
@@ -341,6 +345,25 @@ def plot_explained_variance(df, title, filename):
     ax.grid(alpha=0.25)
     savefig(filename)
 
+def pca_kmeans_eval(df, name, prefix):
+    # (a) mismas 3 líneas que en pca_plot
+    meta_cols = {"pid", "class", "window", "start_s"}
+    feature_cols = [c for c in df.columns if c not in meta_cols]
+    Xz = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+
+    # Paso 2: PCA con los componentes mínimos para el 90%
+    pca = PCA(n_components=0.90, svd_solver="full")
+    Z = pca.fit_transform(Xz)
+    print(name, "→", pca.n_components_, "componentes,",
+          f"{pca.explained_variance_ratio_.sum()*100:.1f}% varianza")
+    pca_df = df[["pid", "class", "window", "start_s"]].copy()
+    for i in range(Z.shape[1]):
+        pca_df[f"PC{i+1}"] = Z[:, i]
+    pca_df.to_csv(OUT / f"{prefix}_pca_scores.csv", index=False)
+    # ... luego el CSV de Z, elbow (4b), K-means (4c), matriz (4d), ROC (4e)
+    ks = range(1, 16)
+    inertias = [KMeans(n_clusters=k, n_init=10, random_state=42).fit(Z).inertia_ for k in ks]
+
 
 # ---------------------------------------------------------------------
 # Main
@@ -384,7 +407,13 @@ def main():
         "PCA — hybrid time + frequency features",
         "10_pca_hybrid.png",
     )
-
+    
+    print("PCA (90%) + K-means...")
+    
+    pca_kmeans_eval(freq_df, "frequency", "09_freq")
+    
+    pca_kmeans_eval(hybrid_df, "hybrid", "10_hybrid")
+    
     print(f"\nDone. Outputs written to: {OUT.resolve()}")
 
 
