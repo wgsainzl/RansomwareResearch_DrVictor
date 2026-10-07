@@ -344,6 +344,13 @@ def plot_explained_variance(df, title, filename):
     ax.set_ylim(0, 102)
     ax.grid(alpha=0.25)
     savefig(filename)
+def map_clusters_to_classes(y_true, clusters):
+    cm = confusion_matrix(y_true, clusters)
+    rows, cols = linear_sum_assignment(-cm)
+    mapping = {c: r for r, c in zip(rows, cols)}
+    y_pred = np.array([mapping[c] for c in clusters])
+    return y_pred, mapping
+
 
 def pca_kmeans_eval(df, name, prefix):
     # (a) mismas 3 líneas que en pca_plot
@@ -360,9 +367,24 @@ def pca_kmeans_eval(df, name, prefix):
     for i in range(Z.shape[1]):
         pca_df[f"PC{i+1}"] = Z[:, i]
     pca_df.to_csv(OUT / f"{prefix}_pca_scores.csv", index=False)
-    # ... luego el CSV de Z, elbow (4b), K-means (4c), matriz (4d), ROC (4e)
-    ks = range(1, 16)
+    ks = range(1, 21)
     inertias = [KMeans(n_clusters=k, n_init=10, random_state=42).fit(Z).inertia_ for k in ks]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(ks, inertias, marker="o")
+    ax.axvline(len(CLASSES), linestyle="--", linewidth=1)
+    ax.set_title(f"Elbow method — {name}")
+    ax.set_xlabel("Number of clusters (k)")
+    ax.set_ylabel("Distortion (inertia)")
+    ax.grid(alpha=0.25)
+    savefig(f"{prefix}_elbow.png")
+
+    classes = [c for c in CLASSES if c in set(df["class"])]
+    class_to_num = {c: i for i, c in enumerate(classes)}
+    y_true = df["class"].map(class_to_num).to_numpy()
+
+    print(class_to_num)
+    print(y_true[:20])
 
 
 # ---------------------------------------------------------------------
