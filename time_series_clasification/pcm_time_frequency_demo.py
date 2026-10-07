@@ -344,6 +344,8 @@ def plot_explained_variance(df, title, filename):
     ax.set_ylim(0, 102)
     ax.grid(alpha=0.25)
     savefig(filename)
+
+
 def map_clusters_to_classes(y_true, clusters):
     cm = confusion_matrix(y_true, clusters)
     rows, cols = linear_sum_assignment(-cm)
@@ -383,8 +385,19 @@ def pca_kmeans_eval(df, name, prefix):
     class_to_num = {c: i for i, c in enumerate(classes)}
     y_true = df["class"].map(class_to_num).to_numpy()
 
-    print(class_to_num)
-    print(y_true[:20])
+    rows = []
+    for seed in range(10):
+        km = KMeans(n_clusters=len(classes), n_init=10, random_state=seed).fit(Z)
+        y_pred, mapping = map_clusters_to_classes(y_true, km.labels_)
+        rows.append({
+            "seed": seed,
+            "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
+            "f1_macro": f1_score(y_true, y_pred, average="macro"),
+            "ARI": adjusted_rand_score(y_true, km.labels_),
+            "silhouette": silhouette_score(Z, km.labels_),
+        })
+    metrics = pd.DataFrame(rows)
+    print(metrics.agg(["mean", "std"]).round(3))
 
 
 # ---------------------------------------------------------------------
