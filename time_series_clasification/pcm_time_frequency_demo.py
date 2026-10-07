@@ -39,7 +39,7 @@ WINDOW_S = 20              # seconds/window
 WINDOW_N = int(FS * WINDOW_S)
 #N_PIDS_PER_CLASS = 5
 
-METRICS = ["CPI", "IPC", "LLC_MPKI"]
+METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "mlc", "cryptsky"]
 
 
