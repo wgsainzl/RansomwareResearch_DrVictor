@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from sklearn.metrics import (confusion_matrix, precision_score, f1_score,
+from sklearn.metrics import (confusion_matrix, precision_score, recall_score, f1_score,
                              adjusted_rand_score, silhouette_score, roc_auc_score)
 from scipy.optimize import linear_sum_assignment
 
@@ -392,6 +392,7 @@ def pca_kmeans_eval(df, name, prefix):
         rows.append({
             "seed": seed,
             "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
+            "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
             "f1_macro": f1_score(y_true, y_pred, average="macro"),
             "ARI": adjusted_rand_score(y_true, km.labels_),
             "silhouette": silhouette_score(Z, km.labels_),
@@ -448,21 +449,17 @@ def main():
         "07_hybrid_pca_explained_variance.png",
     )
 
-    print("Generating 2-D PCA plots...")
+    plot_explained_variance(
+        freq_df,
+        "PCA cumulative explained variance — frequency features",
+        "07_frequency_pca_explained_variance.png",
+    )
+
+    print("Generating time-domain PCA plot...")
     pca_plot(
         time_df,
         "PCA — time-domain features (mean + standard deviation)",
         "08_pca_time_domain.png",
-    )
-    pca_plot(
-        freq_df,
-        "PCA — frequency-domain features",
-        "09_pca_frequency_domain.png",
-    )
-    pca_plot(
-        hybrid_df,
-        "PCA — hybrid time + frequency features",
-        "10_pca_hybrid.png",
     )
     
     print("PCA (90%) + K-means...")
