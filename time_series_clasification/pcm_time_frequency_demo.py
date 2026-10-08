@@ -398,7 +398,29 @@ def pca_kmeans_eval(df, name, prefix):
         })
     metrics = pd.DataFrame(rows)
     print(metrics.agg(["mean", "std"]).round(3))
+    
+    km_ref = KMeans(n_clusters=len(classes), n_init=10, random_state=42).fit(Z)
+    y_pred_ref, mapping_ref = map_clusters_to_classes(y_true, km_ref.labels_)
+    cm = confusion_matrix(y_true, y_pred_ref)
 
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(cm, cmap="Blues")
+    fig.colorbar(im, ax=ax)
+
+    ax.set_xticks(range(len(classes)))
+    ax.set_xticklabels(classes, rotation=45, ha="right")
+    ax.set_yticks(range(len(classes)))
+    ax.set_yticklabels(classes)
+
+    for i in range(len(classes)):
+        for j in range(len(classes)):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                    color="white" if cm[i, j] > cm.max() / 2 else "black")
+
+    ax.set_xlabel("Predicted class (K-means, mapped)")
+    ax.set_ylabel("True class")
+    ax.set_title(f"Confusion matrix — {name}")
+    savefig(f"{prefix}_confusionmatrix.png")
 
 # ---------------------------------------------------------------------
 # Main
