@@ -132,8 +132,8 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
     if total_power <= 1e-15:
         return {
             "peak_freq": 0.0,
-            "peak_power": 0.0,
-            "spectral_energy": 0.0,
+            "log_peak_power": 0.0,
+            "log_spectral_energy": 0.0,
             "spectral_entropy": 0.0,
         }
 
@@ -143,8 +143,8 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
 
     return {
         "peak_freq": float(freqs_nd[peak_idx]),
-        "peak_power": float(power_nd[peak_idx]),
-        "spectral_energy": float(total_power),
+        "log_peak_power": float(np.log10(power_nd[peak_idx] + 1)),
+        "log_spectral_energy": float(np.log10(total_power + 1)),
         "spectral_entropy": float(entropy),
     }
 
@@ -285,6 +285,7 @@ def plot_fft_examples(raw):
     ax.set_title(f"CPI power spectra for one {WINDOW_S}-second window")
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Power")
+    ax.set_yscale("log")
     ax.legend()
     ax.grid(alpha=0.25)
     savefig("06_cpi_power_spectra.png")
@@ -355,12 +356,10 @@ def map_clusters_to_classes(y_true, clusters):
 
 
 def pca_kmeans_eval(df, name, prefix):
-    # (a) mismas 3 líneas que en pca_plot
     meta_cols = {"pid", "class", "window", "start_s"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
     Xz = StandardScaler().fit_transform(df[feature_cols].to_numpy())
 
-    # Paso 2: PCA con los componentes mínimos para el 90%
     pca = PCA(n_components=0.90, svd_solver="full")
     Z = pca.fit_transform(Xz)
     print(name, "→", pca.n_components_, "componentes,",
@@ -463,6 +462,8 @@ def main():
     )
     
     print("PCA (90%) + K-means...")
+
+    pca_kmeans_eval(time_df, "time", "08_time")
     
     pca_kmeans_eval(freq_df, "frequency", "09_freq")
     
