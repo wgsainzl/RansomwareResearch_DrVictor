@@ -168,8 +168,8 @@ def extract_features(raw: pd.DataFrame):
             x = win[metric].to_numpy()
 
             # Time-domain features.
-            trow[f"{metric}_mean"] = float(np.mean(x))
-            trow[f"{metric}_std"] = float(np.std(x))
+            trow[f"{metric}_log_mean"] = float(np.log10(np.mean(x) + 1))
+            trow[f"{metric}_log_std"]  = float(np.log10(np.std(x) + 1))
 
             # Frequency-domain features.
             sf = spectral_features(x, FS)
@@ -397,7 +397,7 @@ def pca_kmeans_eval(df, name, prefix):
             "silhouette": silhouette_score(Z, km.labels_),
         })
     metrics = pd.DataFrame(rows)
-    print(metrics.agg(["mean", "std"]).round(3))
+    print(metrics.drop(columns="seed").agg(["mean", "std"]).round(3))
     
     km_ref = KMeans(n_clusters=len(classes), n_init=10, random_state=42).fit(Z)
     y_pred_ref, mapping_ref = map_clusters_to_classes(y_true, km_ref.labels_)
@@ -457,7 +457,7 @@ def main():
     print("Generating time-domain PCA plot...")
     pca_plot(
         time_df,
-        "PCA — time-domain features (mean + standard deviation)",
+        "PCA — time-domain features (log mean + log standard deviation)",
         "08_pca_time_domain.png",
     )
     
