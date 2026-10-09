@@ -422,6 +422,22 @@ def pca_kmeans_eval(df, name, prefix):
     ax.set_title(f"Confusion matrix — {name}")
     savefig(f"{prefix}_confusionmatrix.png")
 
+    # E1. ¿Qué número de cluster quedó mapeado a cryptsky?
+    #     mapping_ref es {cluster: clase}; necesitas el cluster cuya clase sea la de cryptsky
+    target = class_to_num["cryptsky"]
+    c_rw = [c for c, cls in mapping_ref.items() if cls == target][0]
+    
+    # E2. Distancia de cada ventana a ese centroide
+    center = km_ref.cluster_centers_[c_rw]
+    dist = np.linalg.norm(Z - center, axis=1)
+    
+    # E3. Etiqueta binaria: 1 si la ventana es cryptsky, 0 si no
+    y_bin = (y_true == target).astype(int)
+    
+    # E4. AUC: el score debe ser MAYOR para lo más sospechoso
+    auc = roc_auc_score(y_bin, -dist)
+    print(f"ROC AUC cryptsky vs resto: {auc:.3f}")
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
