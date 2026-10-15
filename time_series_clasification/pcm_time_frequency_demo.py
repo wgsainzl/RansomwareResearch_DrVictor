@@ -47,7 +47,7 @@ RNG = np.random.default_rng(42)
 # Carpeta con los resultados. Se espera una subcarpeta por clase, por ejemplo:
 #   ~/Desktop/Resultados_ALL/7zip/xxx_pcm_1.csv
 #   ~/Desktop/Resultados_ALL/cryptsky/xxx_pcm_1.csv
-DATA_DIR = Path.home() / "Desktop" / "Resultados_ALL"
+DATA_DIR = Path.home() / "Desktop" / "Research" / "Resultados_ALL"
 
 FS = 10.0                  # Frecuencia de muestreo: 10 muestras por segundo (PCM cada 0.1 s)
 WINDOW_S = 20              # Duración de cada ventana en segundos
