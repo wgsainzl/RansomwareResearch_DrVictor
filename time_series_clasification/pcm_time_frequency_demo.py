@@ -177,8 +177,8 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
 
     Features que devuelve:
       peak_freq           → frecuencia (Hz) con más energía (el "ritmo" dominante)
-      log_peak_power      → log10 de la energía de ese pico
-      log_spectral_energy → log10 de la energía total (sin contar la media)
+      peak_power          → la energía de ese pico
+      spectral_energy     →  la energía total (sin contar la media)
       spectral_entropy    → qué tan repartida está la energía
                             (baja = periódica/ordenada, alta = ruidosa)
     """
@@ -202,8 +202,8 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
     if total_power <= 1e-15:
         return {
             "peak_freq": 0.0,
-            "log_peak_power": 0.0,
-            "log_spectral_energy": 0.0,
+            "peak_power": 0.0,
+            "spectral_energy": 0.0,
             "spectral_entropy": 0.0,
         }
 
@@ -217,8 +217,8 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
     # no dominen a los demás features.
     return {
         "peak_freq": float(freqs_nd[peak_idx]),
-        "log_peak_power": float(np.log10(power_nd[peak_idx] + 1)),
-        "log_spectral_energy": float(np.log10(total_power + 1)),
+        "peak_power": float(power_nd[peak_idx]),
+        "spectral_energy": float(total_power),
         "spectral_entropy": float(entropy),
     }
 
@@ -253,8 +253,8 @@ def extract_features(raw: pd.DataFrame):
             # Features de tiempo: nivel promedio y cuánto varía la señal.
             # Se aplica log10(... + 1) para suavizar escalas muy distintas
             # (p. ej. MPKI puede ser 0.1 en una app y 30 en otra).
-            trow[f"{metric}_log_mean"] = float(np.log10(np.mean(x) + 1))
-            trow[f"{metric}_log_std"]  = float(np.log10(np.std(x) + 1))
+            trow[f"{metric}_mean"] = float(np.mean(x))
+            trow[f"{metric}_std"] = float(np.std(x))
 
             # Features de frecuencia: se agregan con el nombre de la métrica
             # como prefijo, p. ej. "CPI_peak_freq", "L2_MPKI_spectral_entropy".
@@ -659,7 +659,7 @@ def main():
     print("Generating time-domain PCA plot...")
     pca_plot(
         time_df,
-        "PCA — time-domain features (log mean + log standard deviation)",
+        "PCA — time-domain features (mean + standard deviation)",
         "08_pca_time_domain.png",
     )
 
