@@ -62,7 +62,7 @@ METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
 
 # Clases (aplicaciones) a cargar. "cryptsky" es el ransomware; el resto son
 # cargas benignas que sirven de comparación.
-CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "mlc", "cryptsky"]
+CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "mlc", "cryptsky", "ransomware"]
 
 
 # Carpeta donde se guardan todas las salidas (se crea si no existe).
