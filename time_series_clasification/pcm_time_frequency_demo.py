@@ -6,7 +6,8 @@ Caracterización microarquitectónica de cargas de trabajo con PCM
 ¿Qué hace este script, en pocas palabras?
 -----------------------------------------
 1. LEE los CSV que genera Intel PCM (contadores de hardware del CPU) para
-   varias aplicaciones: 7zip, ffmpeg, gpg, ..., y el ransomware "cryptsky".
+   varias aplicaciones: 7zip, ffmpeg, gpg, ..., y los ransomware
+   "cryptsky" y "ransomware".
 2. CALCULA 4 métricas por muestra: CPI, IPC, LLC_MPKI y L2_MPKI.
 3. CORTA cada corrida en VENTANAS de 20 segundos.
 4. Para cada ventana EXTRAE "features" (números que la resumen):
@@ -15,7 +16,8 @@ Caracterización microarquitectónica de cargas de trabajo con PCM
      - Híbrido:                 ambas cosas juntas.
 5. Reduce dimensiones con PCA y agrupa con K-means (sin usar etiquetas)
    para ver si las aplicaciones se separan "solas".
-6. Mide qué tan bien salió (precision, recall, F1, ARI, silhouette, AUC)
+6. Mide qué tan bien salió (precision, recall, F1, ARI, silhouette, AUC),
+   tanto por clase como en modo binario maligno vs. benigno,
    y guarda gráficas y CSV en ./pcm_demo_output/
 
 Dependencias:
@@ -45,8 +47,8 @@ RNG = np.random.default_rng(42)
 # Configuración
 # ---------------------------------------------------------------------
 # Carpeta con los resultados. Se espera una subcarpeta por clase, por ejemplo:
-#   ~/Desktop/Resultados_ALL/7zip/xxx_pcm_1.csv
-#   ~/Desktop/Resultados_ALL/cryptsky/xxx_pcm_1.csv
+#   ~/Desktop/Research/Resultados_ALL/7zip/xxx_pcm_1.csv
+#   ~/Desktop/Research/Resultados_ALL/cryptsky/xxx_pcm_1.csv
 DATA_DIR = Path.home() / "Desktop" / "Research" / "Resultados_ALL"
 
 FS = 10.0                  # Frecuencia de muestreo: 10 muestras por segundo (PCM cada 0.1 s)
@@ -60,9 +62,28 @@ WINDOW_N = int(FS * WINDOW_S)   # Muestras por ventana: 10 × 20 = 200
 #   L2_MPKI  = fallos de la caché L2 por cada 1000 instrucciones
 METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
 
-# Clases (aplicaciones) a cargar. "cryptsky" es el ransomware; el resto son
-# cargas benignas que sirven de comparación.
-CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress", "sysbench", "mlc", "cryptsky", "ransomware"]
+# Clases (aplicaciones) a cargar. Las que están en MALICIOUS son ransomware;
+# el resto son cargas benignas que sirven de comparación.
+CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
+           "sysbench", "mlc", "cryptsky", "ransomware"]
+
+# Clases malignas: se dibujan con "X" en el PCA y se usan en las métricas
+# de detección (maligno vs. benigno) y en el ROC AUC.
+# Para agregar otro ransomware en el futuro, basta con añadirlo aquí y en CLASSES.
+MALICIOUS = ["cryptsky", "ransomware"]
+
+# Colores fijos por clase. La paleta por defecto de matplotlib solo tiene 10
+# colores y con 11 clases se repite (ransomware quedaba igual que 7zip).
+# Benignos: paleta tab10 SIN el rojo. Malignos: rojo, negro y, si se agregan más, otros oscuros.
+_BENIGN_PALETTE = [c for i, c in enumerate(plt.get_cmap("tab10").colors) if i != 3]
+_MAL_PALETTE = ["#d62728", "#000000", "#8b0000", "#4b0082"]
+COLORS = {}
+for _c in CLASSES:
+    if _c in MALICIOUS:
+        COLORS[_c] = _MAL_PALETTE[MALICIOUS.index(_c) % len(_MAL_PALETTE)]
+    else:
+        _i = len([k for k in COLORS if k not in MALICIOUS])
+        COLORS[_c] = _BENIGN_PALETTE[_i % len(_BENIGN_PALETTE)]
 
 
 # Carpeta donde se guardan todas las salidas (se crea si no existe).
@@ -143,6 +164,13 @@ def load_pcm_dataset() -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def first_pid(raw: pd.DataFrame, label: str):
+    """Devuelve el id de la primera corrida de una clase, o None si la clase no tiene datos.
+    Evita que las gráficas truenen si alguna carpeta está vacía."""
+    m = raw["class"] == label
+    return raw.loc[m, "pid"].iloc[0] if m.any() else None
+
+
 # ---------------------------------------------------------------------
 # Ventaneo y extracción de features
 # ---------------------------------------------------------------------
@@ -213,8 +241,6 @@ def spectral_features(x: np.ndarray, fs: float) -> dict:
     p = power_nd / total_power
     entropy = -(p * np.log2(p + 1e-15)).sum()   # +1e-15 evita log(0)
 
-    # Se usa log10(... + 1) para comprimir valores muy grandes y que
-    # no dominen a los demás features.
     return {
         "peak_freq": float(freqs_nd[peak_idx]),
         "peak_power": float(power_nd[peak_idx]),
@@ -251,8 +277,6 @@ def extract_features(raw: pd.DataFrame):
             x = win[metric].to_numpy()
 
             # Features de tiempo: nivel promedio y cuánto varía la señal.
-            # Se aplica log10(... + 1) para suavizar escalas muy distintas
-            # (p. ej. MPKI puede ser 0.1 en una app y 30 en otra).
             trow[f"{metric}_mean"] = float(np.mean(x))
             trow[f"{metric}_std"] = float(np.std(x))
 
@@ -286,53 +310,51 @@ def savefig(name):
 
 def plot_raw_examples(raw):
     """Gráficas 01 y 02: la serie de tiempo completa de CPI y de LLC_MPKI,
-    tomando la PRIMERA corrida de cada clase como ejemplo representativo."""
-    # Una corrida representativa por clase.
-    fig, ax = plt.subplots(figsize=(11, 5))
-    for label in CLASSES:
-        pid = raw.loc[raw["class"] == label, "pid"].iloc[0]   # primera corrida de esa clase
-        g = raw[raw["pid"] == pid]
-        ax.plot(g["time_s"], g["CPI"], label=f"{label} (run {pid})", linewidth=1.2)
-    ax.set_title("PCM CPI time series (System)")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("CPI")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    savefig("01_raw_cpi_timeseries.png")
-
-    # Lo mismo, pero con los fallos de caché L3 por cada mil instrucciones.
-    fig, ax = plt.subplots(figsize=(11, 5))
-    for label in CLASSES:
-        pid = raw.loc[raw["class"] == label, "pid"].iloc[0]
-        g = raw[raw["pid"] == pid]
-        ax.plot(g["time_s"], g["LLC_MPKI"], label=f"{label} (run {pid})", linewidth=1.2)
-    ax.set_title("PCM LLC MPKI time series (System)")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("LLC MPKI")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    savefig("02_raw_llc_mpki_timeseries.png")
+    tomando la PRIMERA corrida de cada clase como ejemplo representativo.
+    Las clases malignas se dibujan con línea más gruesa."""
+    for metric, title, ylabel, fname in [
+        ("CPI", "PCM CPI time series (System)", "CPI", "01_raw_cpi_timeseries.png"),
+        ("LLC_MPKI", "PCM LLC MPKI time series (System)", "LLC MPKI", "02_raw_llc_mpki_timeseries.png"),
+    ]:
+        fig, ax = plt.subplots(figsize=(11, 5))
+        for label in CLASSES:
+            pid = first_pid(raw, label)
+            if pid is None:
+                continue
+            g = raw[raw["pid"] == pid]
+            ax.plot(g["time_s"], g[metric], label=f"{label} (run {pid})",
+                    color=COLORS[label],
+                    linewidth=2.0 if label in MALICIOUS else 1.2)
+        ax.set_title(title)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1))
+        ax.grid(alpha=0.25)
+        savefig(fname)
 
 
 def plot_window_example(raw):
-    """Gráfica 03: muestra UNA sola ventana de 20 s de cryptsky y su media,
-    para ilustrar qué es exactamente lo que se resume en cada fila de features."""
-    label = "cryptsky"
-    pid = raw.loc[raw["class"] == label, "pid"].iloc[0]
-    g = raw[raw["pid"] == pid].sort_values("time_s").reset_index(drop=True)
-    win = g.iloc[:WINDOW_N]   # primeras 200 muestras = primera ventana
+    """Gráfica 03: muestra UNA sola ventana de 20 s de cada clase maligna y su media,
+    para ilustrar qué es exactamente lo que se resume en cada fila de features.
+    Genera un archivo por clase: 03_single_window_mean_<clase>.png"""
+    for label in MALICIOUS:
+        pid = first_pid(raw, label)
+        if pid is None:
+            continue
+        g = raw[raw["pid"] == pid].sort_values("time_s").reset_index(drop=True)
+        win = g.iloc[:WINDOW_N]   # primeras 200 muestras = primera ventana
 
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    ax.plot(win["time_s"], win["CPI"], marker="o", markersize=2)
-    # Línea punteada horizontal = el promedio de la ventana (feature "log_mean").
-    ax.axhline(win["CPI"].mean(), linestyle="--",
-               label=f"mean={win['CPI'].mean():.3f}")
-    ax.set_title(f"One {WINDOW_S}-second CPI window — {label} (run {pid})")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("CPI")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    savefig("03_single_window_mean.png")
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.plot(win["time_s"], win["CPI"], marker="o", markersize=2, color=COLORS[label])
+        # Línea punteada horizontal = el promedio de la ventana (feature "CPI_mean").
+        ax.axhline(win["CPI"].mean(), linestyle="--",
+                   label=f"mean={win['CPI'].mean():.3f}")
+        ax.set_title(f"One {WINDOW_S}-second CPI window — {label} (run {pid})")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("CPI")
+        ax.legend()
+        ax.grid(alpha=0.25)
+        savefig(f"03_single_window_mean_{label}.png")
 
 
 def plot_same_mean_different_structure():
@@ -345,7 +367,6 @@ def plot_same_mean_different_structure():
     las distingue claramente: la periódica tiene un pico en 0.4 Hz y el
     ruido tiene la energía repartida. Por eso agregamos features de frecuencia.
     """
-    # Media/desviación similares, distinta organización en el tiempo.
     n = WINDOW_N
     t = np.arange(n) / FS
     a = 1.0 + 0.18*np.sin(2*np.pi*0.4*t)       # senoidal de 0.4 Hz
@@ -381,18 +402,21 @@ def plot_fft_examples(raw):
     El eje Y es logarítmico para poder ver a la vez picos grandes y pequeños."""
     fig, ax = plt.subplots(figsize=(10, 5))
     for label in CLASSES:
-        pid = raw.loc[raw["class"] == label, "pid"].iloc[0]
+        pid = first_pid(raw, label)
+        if pid is None:
+            continue
         g = raw[raw["pid"] == pid].sort_values("time_s").reset_index(drop=True)
         x = g.iloc[:WINDOW_N]["CPI"].to_numpy()
         centered = x - x.mean()
         freq = np.fft.rfftfreq(len(x), 1/FS)
         power = np.abs(np.fft.rfft(centered)) ** 2
-        ax.plot(freq[1:], power[1:], label=label)
+        ax.plot(freq[1:], power[1:], label=label, color=COLORS[label],
+                linewidth=2.0 if label in MALICIOUS else 1.2)
     ax.set_title(f"CPI power spectra for one {WINDOW_S}-second window")
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Power")
     ax.set_yscale("log")
-    ax.legend()
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1))
     ax.grid(alpha=0.25)
     savefig("06_cpi_power_spectra.png")
 
@@ -427,21 +451,24 @@ def pca_plot(df, title, filename):
         m = pca_df["class"] == label
         if not m.any():
             continue
-        # El ransomware se dibuja resaltado (X grande con borde negro).
-        is_rw = (label == "cryptsky")
+        # Los ransomware se dibujan resaltados (X grande con borde negro).
+        is_rw = label in MALICIOUS
         ax.scatter(pca_df.loc[m, "PC1"], pca_df.loc[m, "PC2"],
                    label=label,
+                   color=COLORS[label],
                    marker="X" if is_rw else "o",
                    s=120 if is_rw else 35,
-                   edgecolors="black" if is_rw else "none",
-                   alpha=0.9 if is_rw else 0.6)
+                   # borde blanco para que la X negra se distinga; negro para la roja
+                   edgecolors=("white" if COLORS[label] == "#000000" else "black") if is_rw else "none",
+                   alpha=0.9 if is_rw else 0.6,
+                   zorder=3 if is_rw else 2)   # malignos encima de los benignos
 
     # Porcentaje de la variación total que explica cada componente.
     evr = pca.explained_variance_ratio_ * 100
     ax.set_title(title)
     ax.set_xlabel(f"PC1 ({evr[0]:.1f}% variance)")
     ax.set_ylabel(f"PC2 ({evr[1]:.1f}% variance)")
-    ax.legend()
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1))
     ax.grid(alpha=0.25)
     savefig(filename)
 
@@ -496,10 +523,10 @@ def pca_kmeans_eval(df, name, prefix):
       2. PCA conservando el 90% de la varianza.
       3. Método del codo (k = 1..20) para ver cuántos grupos "naturales" hay.
       4. K-means con k = número de clases, repetido con 10 semillas,
-         y métricas promedio ± desviación.
+         y métricas promedio ± desviación (multiclase y maligno vs. benigno).
       5. Matriz de confusión para una corrida de referencia (semilla 42).
-      6. ROC AUC: ¿qué tan bien separa a cryptsky del resto la distancia
-         al centroide de cryptsky?
+      6. ROC AUC: ¿qué tan bien separa la distancia a los centroides de los
+         clusters malignos a las ventanas de ransomware de las benignas?
     """
     meta_cols = {"pid", "class", "window", "start_s"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
@@ -510,6 +537,7 @@ def pca_kmeans_eval(df, name, prefix):
     # se necesitan para explicar al menos el 90% de la varianza.
     pca = PCA(n_components=0.90, svd_solver="full")
     Z = pca.fit_transform(Xz)
+    print(f"\n=== {name} ===")
     print(name, "→", pca.n_components_, "componentes,",
           f"{pca.explained_variance_ratio_.sum()*100:.1f}% varianza")
     # Guardar las coordenadas de cada ventana en el espacio PCA.
@@ -541,6 +569,12 @@ def pca_kmeans_eval(df, name, prefix):
     class_to_num = {c: i for i, c in enumerate(classes)}
     y_true = df["class"].map(class_to_num).to_numpy()
 
+    # Clases malignas presentes en los datos y su versión numérica.
+    mal_present = [c for c in MALICIOUS if c in class_to_num]
+    mal_nums = [class_to_num[c] for c in mal_present]
+    # Etiqueta binaria verdadera: 1 = ventana de ransomware (cualquiera), 0 = benigna.
+    y_true_bin = np.isin(y_true, mal_nums).astype(int)
+
     # --- Paso 4: K-means con 10 semillas distintas ---
     # K-means depende del punto de inicio, así que se repite con varias
     # semillas para reportar promedio y desviación (más honesto que una sola corrida).
@@ -551,11 +585,16 @@ def pca_kmeans_eval(df, name, prefix):
     #                     no necesita el emparejamiento húngaro
     #   silhouette      → qué tan compactos y separados son los clusters (-1 a 1);
     #                     no usa las etiquetas reales
+    #   mal_precision / mal_recall / mal_f1 → detección binaria maligno vs. benigno:
+    #                     una ventana se considera "detectada" si cae en un cluster
+    #                     emparejado con CUALQUIER clase maligna. Así, confundir
+    #                     cryptsky con ransomware NO cuenta como error de detección.
     # Nota: K-means nunca ve las etiquetas; solo se usan después para evaluar.
     rows = []
     for seed in range(10):
         km = KMeans(n_clusters=len(classes), n_init=10, random_state=seed).fit(Z)
         y_pred, mapping = map_clusters_to_classes(y_true, km.labels_)
+        y_pred_bin = np.isin(y_pred, mal_nums).astype(int)
         rows.append({
             "seed": seed,
             "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
@@ -563,10 +602,14 @@ def pca_kmeans_eval(df, name, prefix):
             "f1_macro": f1_score(y_true, y_pred, average="macro"),
             "ARI": adjusted_rand_score(y_true, km.labels_),
             "silhouette": silhouette_score(Z, km.labels_),
+            "mal_precision": precision_score(y_true_bin, y_pred_bin, zero_division=0),
+            "mal_recall": recall_score(y_true_bin, y_pred_bin, zero_division=0),
+            "mal_f1": f1_score(y_true_bin, y_pred_bin, zero_division=0),
         })
     metrics = pd.DataFrame(rows)
+    metrics.to_csv(OUT / f"{prefix}_kmeans_metrics.csv", index=False)
     # Imprime una tabla con el promedio y la desviación estándar de cada métrica.
-    print(metrics.drop(columns="seed").agg(["mean", "std"]).round(3))
+    print(metrics.drop(columns="seed").agg(["mean", "std"]).round(3).T)
 
     # --- Paso 5: matriz de confusión (corrida de referencia, semilla 42) ---
     # Filas = clase real, columnas = clase predicha (cluster ya emparejado).
@@ -583,6 +626,11 @@ def pca_kmeans_eval(df, name, prefix):
     ax.set_xticklabels(classes, rotation=45, ha="right")
     ax.set_yticks(range(len(classes)))
     ax.set_yticklabels(classes)
+    # Nombres de las clases malignas en rojo para ubicarlas rápido.
+    for tick in ax.get_xticklabels() + ax.get_yticklabels():
+        if tick.get_text() in MALICIOUS:
+            tick.set_color("red")
+            tick.set_fontweight("bold")
 
     # Escribe el número dentro de cada celda (blanco si el fondo es oscuro).
     for i in range(len(classes)):
@@ -595,28 +643,41 @@ def pca_kmeans_eval(df, name, prefix):
     ax.set_title(f"Confusion matrix — {name}")
     savefig(f"{prefix}_confusionmatrix.png")
 
-    # --- Paso 6: ROC AUC de cryptsky contra todo lo demás ---
-    # Idea: si una ventana está cerca del centroide del cluster de cryptsky,
+    # --- Paso 6: ROC AUC de los ransomware contra las cargas benignas ---
+    # Idea: si una ventana está cerca del centroide de algún cluster maligno,
     # es "sospechosa". Medimos qué tan bien esa cercanía separa
     # ransomware (1) de benigno (0).
     #   AUC = 1.0 → separación perfecta
     #   AUC = 0.5 → igual que adivinar al azar
+    if not mal_present:
+        print("[aviso] no hay clases malignas en los datos; se omite el ROC AUC")
+        return
 
-    # ¿Qué número de cluster quedó mapeado a cryptsky?
-    target = class_to_num["cryptsky"]
-    c_rw = [c for c, cls in mapping_ref.items() if cls == target][0]
+    # Cluster que quedó emparejado con cada clase (clase numérica → cluster).
+    class_to_cluster = {cls: c for c, cls in mapping_ref.items()}
 
-    # Distancia de cada ventana a ese centroide
-    center = km_ref.cluster_centers_[c_rw]
-    dist = np.linalg.norm(Z - center, axis=1)   # distancia euclidiana
+    # Distancia euclidiana de cada ventana al centroide de cada cluster maligno.
+    dists = {}
+    for cname in mal_present:
+        center = km_ref.cluster_centers_[class_to_cluster[class_to_num[cname]]]
+        dists[cname] = np.linalg.norm(Z - center, axis=1)
 
-    # Etiqueta binaria: 1 si la ventana es cryptsky, 0 si no
-    y_bin = (y_true == target).astype(int)
+    benign = y_true_bin == 0
 
-    # AUC: el score debe ser MAYOR para lo más sospechoso.
-    # Como "más cerca" = "más sospechoso", se usa la distancia con signo negativo.
-    auc = roc_auc_score(y_bin, -dist)
-    print(f"ROC AUC cryptsky vs resto: {auc:.3f}")
+    # (a) AUC por cada ransomware, contra SOLO las ventanas benignas
+    #     (se excluye al otro ransomware para que no cuente como "negativo").
+    for cname in mal_present:
+        m = benign | (y_true == class_to_num[cname])
+        y_bin = (y_true[m] == class_to_num[cname]).astype(int)
+        # El score debe ser MAYOR para lo más sospechoso → distancia con signo negativo.
+        auc = roc_auc_score(y_bin, -dists[cname][m])
+        print(f"ROC AUC {cname} vs benignos: {auc:.3f}")
+
+    # (b) AUC combinado: cualquier ransomware vs. benignos.
+    #     Score = distancia al centroide maligno MÁS CERCANO.
+    min_dist = np.min(np.vstack(list(dists.values())), axis=0)
+    auc_all = roc_auc_score(y_true_bin, -min_dist)
+    print(f"ROC AUC malignos ({' + '.join(mal_present)}) vs benignos: {auc_all:.3f}")
 
 
 # ---------------------------------------------------------------------
