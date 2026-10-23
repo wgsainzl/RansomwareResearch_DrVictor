@@ -9,7 +9,8 @@ Caracterización microarquitectónica de cargas de trabajo con PCM
    varias aplicaciones: 7zip, ffmpeg, gpg, ..., y los ransomware
    "cryptsky" y "ransomware".
 2. CALCULA 4 métricas por muestra: CPI, IPC, LLC_MPKI y L2_MPKI.
-3. CORTA cada corrida en VENTANAS de 20 segundos.
+3. CORTA cada corrida en VENTANAS de 1, 2, 5, 10, 15 y 20 segundos
+   (el análisis completo se repite para cada tamaño, en su propia carpeta).
 4. Para cada ventana EXTRAE "features" (números que la resumen):
      - Dominio del tiempo:      promedio y variación.
      - Dominio de la frecuencia: qué tan periódica/ruidosa es la señal (FFT).
@@ -18,7 +19,9 @@ Caracterización microarquitectónica de cargas de trabajo con PCM
    para ver si las aplicaciones se separan "solas".
 6. Mide qué tan bien salió (precision, recall, F1, ARI, silhouette, AUC),
    tanto por clase como en modo binario maligno vs. benigno,
-   y guarda gráficas y CSV en ./pcm_demo_output/
+   y guarda gráficas, CSV y un resumen stats.md en ./pcm_demo_output/window_XXs/,
+   más una tabla comparativa de todas las ventanas en
+   ./pcm_demo_output/stats_all_windows.md
 
 Dependencias:
     pip install numpy pandas matplotlib scikit-learn scipy
@@ -28,6 +31,7 @@ Ejecutar:
 """
 
 from pathlib import Path
+from datetime import datetime
 import numpy as np                  # cálculo numérico (arreglos, FFT)
 import pandas as pd                 # tablas (DataFrames) y lectura de CSV
 import matplotlib.pyplot as plt     # gráficas
@@ -52,6 +56,14 @@ RNG = np.random.default_rng(42)
 DATA_DIR = Path.home() / "Desktop" / "Research" / "Resultados_ALL"
 
 FS = 10.0                  # Frecuencia de muestreo: 10 muestras por segundo (PCM cada 0.1 s)
+
+# Tamaños de ventana (en segundos) a evaluar. El pipeline completo se corre
+# una vez por cada tamaño y deja sus resultados en su propia carpeta:
+#   pcm_demo_output/window_01s/, window_02s/, ..., window_20s/
+WINDOW_SIZES_S = [1, 2, 5, 10, 15, 20]
+
+# Ventana "actual". main() las cambia en cada iteración con set_window();
+# todas las funciones leen estos valores al momento de ejecutarse.
 WINDOW_S = 20              # Duración de cada ventana en segundos
 WINDOW_N = int(FS * WINDOW_S)   # Muestras por ventana: 10 × 20 = 200
 
@@ -86,9 +98,20 @@ for _c in CLASSES:
         COLORS[_c] = _BENIGN_PALETTE[_i % len(_BENIGN_PALETTE)]
 
 
-# Carpeta donde se guardan todas las salidas (se crea si no existe).
-OUT = Path("pcm_demo_output")
-OUT.mkdir(exist_ok=True)
+# Carpeta raíz de salidas. Dentro se crea una subcarpeta por tamaño de ventana;
+# OUT apunta a la subcarpeta de la ventana que se está procesando.
+BASE_OUT = Path("pcm_demo_output")
+OUT = BASE_OUT
+
+
+def set_window(window_s: int):
+    """Fija la ventana actual (WINDOW_S, WINDOW_N) y la carpeta de salida OUT.
+    Ejemplo: window_s=5 → 50 muestras por ventana y salida en pcm_demo_output/window_05s/"""
+    global WINDOW_S, WINDOW_N, OUT
+    WINDOW_S = window_s
+    WINDOW_N = int(FS * window_s)
+    OUT = BASE_OUT / f"window_{window_s:02d}s"
+    OUT.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------
@@ -142,8 +165,9 @@ def load_pcm_csv(path: Path, label: str, run_id: int) -> pd.DataFrame:
     return out
 
 
-def load_pcm_dataset() -> pd.DataFrame:
-    """Recorre todas las clases, lee todos sus CSV de PCM y los une en una sola tabla."""
+def load_pcm_dataset(min_samples: int) -> pd.DataFrame:
+    """Recorre todas las clases, lee todos sus CSV de PCM y los une en una sola tabla.
+    Se omiten las corridas con menos de `min_samples` muestras."""
     frames = []
     run_id = 1000   # los ids de corrida empiezan en 1000 y suben de uno en uno
     for label in CLASSES:
@@ -154,9 +178,11 @@ def load_pcm_dataset() -> pd.DataFrame:
             continue
         for f in files:
             d = load_pcm_csv(f, label, run_id)
-            # Si la corrida es más corta que una ventana (200 muestras), no sirve.
-            if len(d) < WINDOW_N:
-                print(f"[aviso] {f.name}: {len(d)} muestras (< {WINDOW_N}), se omite")
+            # Si la corrida es más corta que la ventana más grande, se omite.
+            # Así TODAS las ventanas usan exactamente las mismas corridas
+            # y la comparación entre tamaños de ventana es justa.
+            if len(d) < min_samples:
+                print(f"[aviso] {f.name}: {len(d)} muestras (< {min_samples}), se omite")
                 continue
             frames.append(d)
             run_id += 1
@@ -342,7 +368,7 @@ def plot_window_example(raw):
         if pid is None:
             continue
         g = raw[raw["pid"] == pid].sort_values("time_s").reset_index(drop=True)
-        win = g.iloc[:WINDOW_N]   # primeras 200 muestras = primera ventana
+        win = g.iloc[:WINDOW_N]   # primeras WINDOW_N muestras = primera ventana
 
         fig, ax = plt.subplots(figsize=(10, 4.5))
         ax.plot(win["time_s"], win["CPI"], marker="o", markersize=2, color=COLORS[label])
@@ -515,7 +541,19 @@ def map_clusters_to_classes(y_true, clusters):
     return y_pred, mapping
 
 
-def pca_kmeans_eval(df, name, prefix):
+def md_table(header, rows) -> str:
+    """Arma una tabla en Markdown a partir de un encabezado y una lista de filas.
+    (Se hace a mano para no depender del paquete 'tabulate'.)"""
+    def fmt(v):
+        return f"{v:.3f}" if isinstance(v, (float, np.floating)) else str(v)
+    lines = ["| " + " | ".join(header) + " |",
+             "|" + "|".join(["---"] * len(header)) + "|"]
+    for r in rows:
+        lines.append("| " + " | ".join(fmt(v) for v in r) + " |")
+    return "\n".join(lines)
+
+
+def pca_kmeans_eval(df, name, prefix, md):
     """Pipeline completo de agrupamiento y evaluación para un conjunto de features.
 
     Pasos:
@@ -527,6 +565,10 @@ def pca_kmeans_eval(df, name, prefix):
       5. Matriz de confusión para una corrida de referencia (semilla 42).
       6. ROC AUC: ¿qué tan bien separa la distancia a los centroides de los
          clusters malignos a las ventanas de ransomware de las benignas?
+
+    Todo lo que se imprime también se agrega a la lista `md` (secciones en
+    Markdown) que main() escribe en stats.md. Devuelve un diccionario con el
+    resumen de esta familia de features para la tabla comparativa final.
     """
     meta_cols = {"pid", "class", "window", "start_s"}
     feature_cols = [c for c in df.columns if c not in meta_cols]
@@ -537,9 +579,12 @@ def pca_kmeans_eval(df, name, prefix):
     # se necesitan para explicar al menos el 90% de la varianza.
     pca = PCA(n_components=0.90, svd_solver="full")
     Z = pca.fit_transform(Xz)
+    var_pct = pca.explained_variance_ratio_.sum() * 100
     print(f"\n=== {name} ===")
-    print(name, "→", pca.n_components_, "componentes,",
-          f"{pca.explained_variance_ratio_.sum()*100:.1f}% varianza")
+    print(name, "→", pca.n_components_, "componentes,", f"{var_pct:.1f}% varianza")
+    md.append(f"## Features: {name}\n")
+    md.append(f"- Features de entrada: {len(feature_cols)}")
+    md.append(f"- PCA: {pca.n_components_} componentes ({var_pct:.1f}% de la varianza)\n")
     # Guardar las coordenadas de cada ventana en el espacio PCA.
     pca_df = df[["pid", "class", "window", "start_s"]].copy()
     for i in range(Z.shape[1]):
@@ -601,7 +646,11 @@ def pca_kmeans_eval(df, name, prefix):
             "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
             "f1_macro": f1_score(y_true, y_pred, average="macro"),
             "ARI": adjusted_rand_score(y_true, km.labels_),
-            "silhouette": silhouette_score(Z, km.labels_),
+            # Con ventanas cortas (1–2 s) puede haber muchísimas ventanas y el
+            # silhouette es O(n²); arriba de 5000 se estima con una muestra aleatoria.
+            "silhouette": silhouette_score(Z, km.labels_,
+                                           sample_size=min(len(Z), 5000),
+                                           random_state=seed),
             "mal_precision": precision_score(y_true_bin, y_pred_bin, zero_division=0),
             "mal_recall": recall_score(y_true_bin, y_pred_bin, zero_division=0),
             "mal_f1": f1_score(y_true_bin, y_pred_bin, zero_division=0),
@@ -609,7 +658,15 @@ def pca_kmeans_eval(df, name, prefix):
     metrics = pd.DataFrame(rows)
     metrics.to_csv(OUT / f"{prefix}_kmeans_metrics.csv", index=False)
     # Imprime una tabla con el promedio y la desviación estándar de cada métrica.
-    print(metrics.drop(columns="seed").agg(["mean", "std"]).round(3).T)
+    summary = metrics.drop(columns="seed").agg(["mean", "std"]).T
+    print(summary.round(3))
+    md.append("### K-means (10 semillas)\n")
+    md.append(md_table(["Métrica", "Media", "Desv. est."],
+                       [[m, r["mean"], r["std"]] for m, r in summary.iterrows()]))
+    md.append("")
+    result = {"features": name, "n_pc": int(pca.n_components_)}
+    for m in ["f1_macro", "ARI", "silhouette", "mal_precision", "mal_recall", "mal_f1"]:
+        result[m] = f"{summary.loc[m, 'mean']:.3f} ± {summary.loc[m, 'std']:.3f}"
 
     # --- Paso 5: matriz de confusión (corrida de referencia, semilla 42) ---
     # Filas = clase real, columnas = clase predicha (cluster ya emparejado).
@@ -651,7 +708,8 @@ def pca_kmeans_eval(df, name, prefix):
     #   AUC = 0.5 → igual que adivinar al azar
     if not mal_present:
         print("[aviso] no hay clases malignas en los datos; se omite el ROC AUC")
-        return
+        md.append("_No hay clases malignas en los datos; se omite el ROC AUC._\n")
+        return result
 
     # Cluster que quedó emparejado con cada clase (clase numérica → cluster).
     class_to_cluster = {cls: c for c, cls in mapping_ref.items()}
@@ -663,6 +721,7 @@ def pca_kmeans_eval(df, name, prefix):
         dists[cname] = np.linalg.norm(Z - center, axis=1)
 
     benign = y_true_bin == 0
+    auc_rows = []
 
     # (a) AUC por cada ransomware, contra SOLO las ventanas benignas
     #     (se excluye al otro ransomware para que no cuente como "negativo").
@@ -672,21 +731,34 @@ def pca_kmeans_eval(df, name, prefix):
         # El score debe ser MAYOR para lo más sospechoso → distancia con signo negativo.
         auc = roc_auc_score(y_bin, -dists[cname][m])
         print(f"ROC AUC {cname} vs benignos: {auc:.3f}")
+        auc_rows.append([f"{cname} vs benignos", auc])
+        result[f"AUC {cname}"] = f"{auc:.3f}"
 
     # (b) AUC combinado: cualquier ransomware vs. benignos.
     #     Score = distancia al centroide maligno MÁS CERCANO.
     min_dist = np.min(np.vstack(list(dists.values())), axis=0)
     auc_all = roc_auc_score(y_true_bin, -min_dist)
-    print(f"ROC AUC malignos ({' + '.join(mal_present)}) vs benignos: {auc_all:.3f}")
+    label_all = f"malignos ({' + '.join(mal_present)}) vs benignos"
+    print(f"ROC AUC {label_all}: {auc_all:.3f}")
+    auc_rows.append([label_all, auc_all])
+    result["AUC malignos"] = f"{auc_all:.3f}"
+
+    md.append("### ROC AUC (distancia al centroide maligno, semilla 42)\n")
+    md.append(md_table(["Comparación", "AUC"], auc_rows))
+    md.append("")
+    return result
 
 
 # ---------------------------------------------------------------------
 # Programa principal
 # ---------------------------------------------------------------------
-def main():
-    # 1) Cargar todos los CSV de PCM y guardar la tabla unificada.
-    print("Loading PCM telemetry...")
-    raw = load_pcm_dataset()
+def run_window(raw: pd.DataFrame, window_s: int):
+    """Corre el pipeline completo para UN tamaño de ventana y guarda todo en su carpeta.
+    Devuelve la lista de resúmenes (time, frequency, hybrid) para la tabla global."""
+    set_window(window_s)
+    print(f"\n{'#' * 60}\n# Ventana de {WINDOW_S} s ({WINDOW_N} muestras) → {OUT}\n{'#' * 60}")
+
+    # 1) Tabla unificada de telemetría (la misma en todas las carpetas).
     raw.to_csv(OUT / "pcm_telemetry.csv", index=False)
 
     # 2) Cortar en ventanas y calcular features (tiempo, frecuencia, híbrido).
@@ -728,13 +800,67 @@ def main():
     #    para comparar cuál separa mejor las clases.
     print("PCA (90%) + K-means...")
 
-    pca_kmeans_eval(time_df, "time", "08_time")
+    # Encabezado de stats.md: contexto de la corrida.
+    counts = time_df["class"].value_counts()
+    md = [
+        "# Estadísticas — PCM, PCA + K-means\n",
+        f"- Generado: {datetime.now():%Y-%m-%d %H:%M}",
+        f"- Datos: `{DATA_DIR}`",
+        f"- Ventana: {WINDOW_S} s ({WINDOW_N} muestras a {FS:g} Hz)",
+        f"- Métricas: {', '.join(METRICS)}",
+        f"- Clases malignas: {', '.join(MALICIOUS)}\n",
+        "### Ventanas por clase\n",
+        md_table(["Clase", "Tipo", "Corridas", "Ventanas"],
+                 [[c, "maligna" if c in MALICIOUS else "benigna",
+                   raw.loc[raw["class"] == c, "pid"].nunique(), int(counts.get(c, 0))]
+                  for c in CLASSES if c in counts.index]),
+        "",
+    ]
 
-    pca_kmeans_eval(freq_df, "frequency", "09_freq")
+    results = [
+        pca_kmeans_eval(time_df, "time", "08_time", md),
+        pca_kmeans_eval(freq_df, "frequency", "09_freq", md),
+        pca_kmeans_eval(hybrid_df, "hybrid", "10_hybrid", md),
+    ]
 
-    pca_kmeans_eval(hybrid_df, "hybrid", "10_hybrid")
+    # Tabla comparativa final: una fila por familia de features (media ± desv.).
+    cols = list(results[0].keys())
+    md.append("## Comparación entre familias de features\n")
+    md.append(md_table(cols, [[r.get(c, "") for c in cols] for r in results]))
+    md.append("")
 
-    print(f"\nDone. Outputs written to: {OUT.resolve()}")
+    (OUT / "stats.md").write_text("\n".join(md), encoding="utf-8")
+    print(f"Estadísticas guardadas en {OUT / 'stats.md'}")
+    return results
+
+
+def main():
+    BASE_OUT.mkdir(exist_ok=True)
+
+    # Cargar los CSV una sola vez. Se exige que cada corrida alcance al menos
+    # para una ventana del tamaño MÁS GRANDE, para usar las mismas corridas siempre.
+    print("Loading PCM telemetry...")
+    raw = load_pcm_dataset(min_samples=int(FS * max(WINDOW_SIZES_S)))
+
+    all_results = []
+    for window_s in WINDOW_SIZES_S:
+        for r in run_window(raw, window_s):
+            all_results.append({"window_s": window_s, **r})
+
+    # Resumen global: una fila por (ventana, familia de features), para ver
+    # de un vistazo cómo cambia el desempeño con el tamaño de ventana.
+    cols = ["window_s"] + [c for c in all_results[0] if c != "window_s"]
+    md = [
+        "# Comparación entre tamaños de ventana\n",
+        f"- Generado: {datetime.now():%Y-%m-%d %H:%M}",
+        f"- Ventanas evaluadas: {', '.join(f'{w} s' for w in WINDOW_SIZES_S)}",
+        "- El detalle de cada ventana está en `window_XXs/stats.md`.\n",
+        md_table(cols, [[r.get(c, "") for c in cols] for r in all_results]),
+        "",
+    ]
+    (BASE_OUT / "stats_all_windows.md").write_text("\n".join(md), encoding="utf-8")
+
+    print(f"\nDone. Outputs written to: {BASE_OUT.resolve()}")
 
 
 # Esto hace que main() solo corra cuando ejecutas el archivo directamente
