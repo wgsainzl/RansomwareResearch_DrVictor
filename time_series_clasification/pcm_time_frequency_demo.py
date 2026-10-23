@@ -50,7 +50,7 @@ import matplotlib.pyplot as plt     # gráficas
 from sklearn.preprocessing import StandardScaler   # solo para la gráfica PCA de visualización
 from sklearn.decomposition import PCA              # solo para la gráfica PCA de visualización
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, RandomizedSearchCV
+from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV
 from sklearn.metrics import (confusion_matrix, precision_score, recall_score, f1_score,
                              accuracy_score, roc_auc_score, classification_report)
 
@@ -80,7 +80,7 @@ WINDOW_N = int(FS * WINDOW_S)
 METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
 
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
-           "sysbench", "mlc", "cryptsky"]
+           "sysbench", "mlc", "cryptsky", "ransomware"]
 
 MALICIOUS = ["cryptsky", "ransomware"]
 
@@ -441,18 +441,61 @@ def feature_columns(df):
     return [c for c in df.columns if c not in META_COLS]
 
 
-def make_group_cv(df, max_splits, seed=42):
-    """Validación cruzada estratificada AGRUPADA POR CORRIDA.
+def run_folds(y, groups, n_splits, seed=42):
+    """Pliegues POR CORRIDA, armados a mano clase por clase.
 
     ¿Por qué no usar train_test_split como en el artículo?
     En el artículo cada fila (un café) es independiente. Aquí NO: dos ventanas
     seguidas de la misma corrida son casi idénticas. Si una cae en entrenamiento
     y su "gemela" en prueba, el modelo acierta por memoria y el F1 sale inflado.
-    StratifiedGroupKFold manda corridas COMPLETAS a prueba (group = pid) y trata
-    de que cada pliegue tenga todas las clases (stratified).
+    Por eso se mandan corridas COMPLETAS a prueba.
+
+    ¿Por qué no StratifiedGroupKFold de sklearn?
+    Su reparto es heurístico y, en scikit-learn 1.5–1.7, con 2 corridas por clase
+    llega a meter AMBAS corridas de una clase en el mismo pliegue. Entonces el
+    modelo entrena sin ningún ejemplo de esa clase y su recall sale 0.000
+    (eso le pasaba a mlc y cryptsky). Aquí cada clase reparte sus corridas
+    entre los pliegues de forma explícita: corrida 1 → pliegue 0, corrida 2 →
+    pliegue 1, ... Así, con n_splits <= corridas de cada clase, TODA clase queda
+    en entrenamiento y en prueba en TODOS los pliegues.
+
+    Devuelve una lista de (índices_entrenamiento, índices_prueba).
+    """
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y)
+    groups = np.asarray(groups)
+    fold_of_group = {}
+    for c in np.unique(y):
+        runs = np.unique(groups[y == c])
+        rng.shuffle(runs)
+        start = int(rng.integers(n_splits))   # rota el arranque para equilibrar tamaños
+        for i, g in enumerate(runs):
+            fold_of_group[g] = (start + i) % n_splits
+    fold = np.array([fold_of_group[g] for g in groups])
+    idx = np.arange(len(y))
+    return [(idx[fold != k], idx[fold == k]) for k in range(n_splits)]
+
+
+def check_folds(splits, y, classes):
+    """Verificación de seguridad: avisa si alguna clase falta en el entrenamiento
+    o en la prueba de algún pliegue (el síntoma sería recall = 0.000 en esa clase)."""
+    ok = True
+    for k, (tr, te) in enumerate(splits):
+        for c in range(len(classes)):
+            if c not in set(y[tr]):
+                print(f"[ERROR] pliegue {k}: '{classes[c]}' no tiene ventanas de ENTRENAMIENTO")
+                ok = False
+            if c not in set(y[te]):
+                print(f"[aviso] pliegue {k}: '{classes[c]}' no tiene ventanas de PRUEBA")
+    return ok
+
+
+def make_group_cv(df, max_splits, seed=42):
+    """Calcula cuántos pliegues por corrida caben.
 
     El número de pliegues no puede ser mayor que las corridas de la clase con
     menos corridas: con 3 corridas de cryptsky, máximo 3 pliegues.
+    Devuelve (n_pliegues o None, corridas_por_clase).
     """
     runs = df.groupby("class")["pid"].nunique()
     n = int(min(max_splits, runs.min()))
@@ -461,7 +504,7 @@ def make_group_cv(df, max_splits, seed=42):
     if n < max_splits:
         print(f"[aviso] la clase con menos corridas tiene {runs.min()}; "
               f"se usan {n} pliegues en lugar de {max_splits}")
-    return StratifiedGroupKFold(n_splits=n, shuffle=True, random_state=seed), runs
+    return n, runs
 
 
 def build_model(X_tr, y_tr, g_tr, seed):
@@ -481,12 +524,11 @@ def build_model(X_tr, y_tr, g_tr, seed):
     if runs_min < 2:
         print("[aviso] muy pocas corridas para la búsqueda interna; se usan RF_PARAMS")
         return base.fit(X_tr, y_tr), None
-    inner = StratifiedGroupKFold(n_splits=int(min(3, runs_min)), shuffle=True,
-                                 random_state=seed)
+    inner = run_folds(y_tr, g_tr, int(min(3, runs_min)), seed=seed)
     search = RandomizedSearchCV(base, PARAM_DIST, n_iter=TUNE_ITER, cv=inner,
                                 scoring="f1_macro", random_state=seed,
                                 n_jobs=1)   # el bosque ya usa todos los núcleos
-    search.fit(X_tr, y_tr, groups=g_tr)
+    search.fit(X_tr, y_tr)
     return search.best_estimator_, search.best_params_
 
 
@@ -567,8 +609,8 @@ def rf_eval(df, name, prefix, md):
     md.append(f"- Features de entrada: {len(feats)} (sin escalar y sin PCA)")
 
     # --- Paso 2: pliegues agrupados por corrida ---
-    cv, runs = make_group_cv(df, N_SPLITS)
-    if cv is None:
+    n_splits, runs = make_group_cv(df, N_SPLITS)
+    if n_splits is None:
         msg = (f"_Alguna clase tiene solo {runs.min()} corrida(s); se necesitan al menos 2 "
                "por clase para separar entrenamiento y prueba por corrida._\n")
         print(msg)
@@ -581,8 +623,11 @@ def rf_eval(df, name, prefix, md):
         md.append(f"- Validación: StratifiedKFold, {N_SPLITS} pliegues por VENTANA "
                   "(diagnóstico: ventanas de una misma corrida en train y test)")
     else:
-        splits = list(cv.split(X, y, groups))
-        md.append(f"- Validación: StratifiedGroupKFold, {cv.n_splits} pliegues agrupados por corrida")
+        splits = run_folds(y, groups, n_splits)
+        md.append(f"- Validación: {n_splits} pliegues por corrida (cada clase tiene "
+                  "corridas en entrenamiento y en prueba en todos los pliegues)")
+    if not check_folds(splits, y, classes):
+        md.append("- **ERROR: alguna clase quedó sin datos de entrenamiento en un pliegue**")
     md.append(f"- Búsqueda de hiperparámetros: {'sí (RandomizedSearchCV anidado)' if TUNE else 'no (RF_PARAMS fijos)'}\n")
 
     # --- Pasos 3 y 4: entrenar y medir en cada pliegue ---
@@ -625,7 +670,7 @@ def rf_eval(df, name, prefix, md):
     metrics.to_csv(OUT / f"{prefix}_rf_fold_metrics.csv", index=False)
     summary = metrics.drop(columns=["fold", "n_test_runs"]).agg(["mean", "std"]).T
     print(summary.round(3))
-    md.append(f"### Random Forest ({cv.n_splits} pliegues por corrida)\n")
+    md.append(f"### Random Forest ({len(splits)} pliegues, modo {SPLIT_MODE})\n")
     md.append(md_table(["Métrica", "Media", "Desv. est."],
                        [[m, r["mean"], r["std"]] for m, r in summary.iterrows()]))
     md.append("")
