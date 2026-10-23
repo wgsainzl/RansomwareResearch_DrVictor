@@ -80,7 +80,7 @@ WINDOW_N = int(FS * WINDOW_S)
 METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
 
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
-           "sysbench", "mlc", "cryptsky", "ransomware", "trojan"]
+           "sysbench", "mlc", "cryptsky"]
 
 MALICIOUS = ["cryptsky", "ransomware"]
 
