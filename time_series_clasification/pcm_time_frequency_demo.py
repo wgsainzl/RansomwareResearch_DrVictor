@@ -39,12 +39,18 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np                  # cálculo numérico (arreglos, FFT)
 import pandas as pd                 # tablas (DataFrames) y lectura de CSV
+import matplotlib
+# Backend "Agg": dibuja directo a archivo, sin ventanas. Sin esto, matplotlib usa
+# Tkinter, que choca con los hilos del Random Forest (n_jobs=-1) y el programa
+# truena con "Tcl_AsyncDelete: async handler deleted by the wrong thread".
+# También permite correr el script en una máquina sin interfaz gráfica.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt     # gráficas
 
 from sklearn.preprocessing import StandardScaler   # solo para la gráfica PCA de visualización
 from sklearn.decomposition import PCA              # solo para la gráfica PCA de visualización
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import StratifiedGroupKFold, RandomizedSearchCV
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, RandomizedSearchCV
 from sklearn.metrics import (confusion_matrix, precision_score, recall_score, f1_score,
                              accuracy_score, roc_auc_score, classification_report)
 
@@ -92,8 +98,19 @@ for _c in CLASSES:
         _i = len([k for k in COLORS if k not in MALICIOUS])
         COLORS[_c] = _BENIGN_PALETTE[_i % len(_BENIGN_PALETTE)]
 
-# Carpeta de salida (distinta a la de K-means para poder comparar ambas).
-BASE_OUT = Path("pcm_rf_output")
+# Cómo se separan entrenamiento y prueba (variable de entorno PCM_SPLIT):
+#   "run"    → por corrida completa (StratifiedGroupKFold). Es la evaluación honesta:
+#              el modelo se prueba con corridas que nunca vio. Valor por defecto.
+#   "window" → por ventanas sueltas (StratifiedKFold), IGNORANDO la corrida.
+#              SOLO PARA DIAGNÓSTICO: ventanas de la misma corrida quedan en
+#              entrenamiento y en prueba. Si aquí sale ~1.0 y con "run" sale bajo,
+#              el modelo distingue corridas que ya vio pero no generaliza a corridas nuevas.
+SPLIT_MODE = os.environ.get("PCM_SPLIT", "run")
+if SPLIT_MODE not in ("run", "window"):
+    raise ValueError("PCM_SPLIT debe ser 'run' o 'window'")
+
+# Carpeta de salida (distinta a la de K-means; y otra distinta para el modo diagnóstico).
+BASE_OUT = Path("pcm_rf_output" if SPLIT_MODE == "run" else "pcm_rf_output_window_split")
 OUT = BASE_OUT
 
 # ---------------------------------------------------------------------
@@ -557,8 +574,15 @@ def rf_eval(df, name, prefix, md):
         print(msg)
         md.append(msg)
         return {"features": name}
-    splits = list(cv.split(X, y, groups))
-    md.append(f"- Validación: StratifiedGroupKFold, {cv.n_splits} pliegues agrupados por corrida")
+    if SPLIT_MODE == "window":
+        # Modo diagnóstico: ventanas sueltas, sin respetar la corrida.
+        cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+        splits = list(cv.split(X, y))
+        md.append(f"- Validación: StratifiedKFold, {N_SPLITS} pliegues por VENTANA "
+                  "(diagnóstico: ventanas de una misma corrida en train y test)")
+    else:
+        splits = list(cv.split(X, y, groups))
+        md.append(f"- Validación: StratifiedGroupKFold, {cv.n_splits} pliegues agrupados por corrida")
     md.append(f"- Búsqueda de hiperparámetros: {'sí (RandomizedSearchCV anidado)' if TUNE else 'no (RF_PARAMS fijos)'}\n")
 
     # --- Pasos 3 y 4: entrenar y medir en cada pliegue ---
@@ -755,11 +779,39 @@ def run_window(raw: pd.DataFrame, window_s: int):
     return results
 
 
+def write_run_summary(raw: pd.DataFrame):
+    """Diagnóstico: promedio de cada métrica por CORRIDA (runs_summary.md / .csv).
+
+    Si las dos corridas de una misma aplicación tienen promedios muy distintos
+    (p. ej. CPI 0.8 en una y 1.6 en otra), el modelo no puede aprender la clase
+    a partir de una sola corrida. Esta tabla sirve para detectar eso.
+    La columna "dif_vs_clase_%" es cuánto se aleja el CPI de esa corrida del
+    promedio de su clase.
+    """
+    s = (raw.groupby(["class", "pid", "run_file"], sort=False)[METRICS]
+         .mean().reset_index())
+    s.insert(3, "muestras", raw.groupby("pid", sort=False).size().to_numpy())
+    class_cpi = s.groupby("class")["CPI"].transform("mean")
+    s["dif_vs_clase_%"] = (s["CPI"] - class_cpi) / class_cpi * 100
+    s.to_csv(BASE_OUT / "runs_summary.csv", index=False)
+    md = [
+        "# Promedio de cada métrica por corrida\n",
+        "Si las corridas de una misma clase difieren mucho entre sí, el modelo no generaliza.\n",
+        md_table(list(s.columns), s.values.tolist()),
+        "",
+    ]
+    (BASE_OUT / "runs_summary.md").write_text("\n".join(md), encoding="utf-8")
+    print("\nPromedio por corrida (guardado en runs_summary.md):")
+    print(s.drop(columns="run_file").round(3).to_string(index=False))
+
+
 def main():
     BASE_OUT.mkdir(exist_ok=True)
+    print(f"Modo de separación train/test: {SPLIT_MODE}  →  salida en {BASE_OUT}/")
 
     print("Loading PCM telemetry...")
     raw = load_pcm_dataset(min_samples=int(FS * max(WINDOW_SIZES_S)))
+    write_run_summary(raw)
 
     all_results = []
     for window_s in WINDOW_SIZES_S:
