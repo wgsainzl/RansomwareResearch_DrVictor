@@ -80,7 +80,7 @@ WINDOW_N = int(FS * WINDOW_S)
 METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
 
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
-           "sysbench", "mlc", "cryptsky", "ransomware", "trojan"]
+           "sysbench", "mlc", "cryptsky", "ransomware"]
 
 MALICIOUS = ["cryptsky", "ransomware"]
 
@@ -99,18 +99,35 @@ for _c in CLASSES:
         COLORS[_c] = _BENIGN_PALETTE[_i % len(_BENIGN_PALETTE)]
 
 # Cómo se separan entrenamiento y prueba (variable de entorno PCM_SPLIT):
-#   "run"    → por corrida completa (StratifiedGroupKFold). Es la evaluación honesta:
-#              el modelo se prueba con corridas que nunca vio. Valor por defecto.
+#   "run"      → por corrida completa. Es la evaluación más exigente:
+#                el modelo se prueba con corridas que nunca vio. Valor por defecto.
+#   "temporal" → DENTRO de cada corrida, en orden de tiempo: el primer 80 % de las
+#                ventanas entrena y el último 20 % prueba (ver TEST_FRAC y PCM_RUN).
+#                Responde: "si el modelo ya vio el inicio de una corrida, ¿reconoce
+#                el resto?". Es más fácil que "run" porque train y test vienen de la
+#                misma corrida; no mide si generaliza a corridas nuevas.
 #   "window" → por ventanas sueltas (StratifiedKFold), IGNORANDO la corrida.
 #              SOLO PARA DIAGNÓSTICO: ventanas de la misma corrida quedan en
 #              entrenamiento y en prueba. Si aquí sale ~1.0 y con "run" sale bajo,
 #              el modelo distingue corridas que ya vio pero no generaliza a corridas nuevas.
 SPLIT_MODE = os.environ.get("PCM_SPLIT", "run")
-if SPLIT_MODE not in ("run", "window"):
-    raise ValueError("PCM_SPLIT debe ser 'run' o 'window'")
+if SPLIT_MODE not in ("run", "window", "temporal"):
+    raise ValueError("PCM_SPLIT debe ser 'run', 'window' o 'temporal'")
 
-# Carpeta de salida (distinta a la de K-means; y otra distinta para el modo diagnóstico).
-BASE_OUT = Path("pcm_rf_output" if SPLIT_MODE == "run" else "pcm_rf_output_window_split")
+# Solo para el modo "temporal":
+#   TEST_FRAC → fracción final de cada corrida que se usa como prueba (0.2 = 20 %).
+#   PCM_RUN   → qué corrida de cada workload se usa:
+#               "1" (por defecto) = solo la primera corrida de cada workload,
+#               "2" = solo la segunda, ..., "all" = todas (cada una partida 80/20).
+TEST_FRAC = float(os.environ.get("PCM_TEST_FRAC", "0.2"))
+RUN_CHOICE = os.environ.get("PCM_RUN", "1")
+if not 0 < TEST_FRAC < 1:
+    raise ValueError("PCM_TEST_FRAC debe estar entre 0 y 1")
+
+# Carpeta de salida: una distinta por modo, para no mezclar resultados.
+BASE_OUT = Path({"run": "pcm_rf_output",
+                 "window": "pcm_rf_output_window_split",
+                 "temporal": f"pcm_rf_output_temporal_run{RUN_CHOICE}"}[SPLIT_MODE])
 OUT = BASE_OUT
 
 # ---------------------------------------------------------------------
@@ -476,6 +493,30 @@ def run_folds(y, groups, n_splits, seed=42):
     return [(idx[fold != k], idx[fold == k]) for k in range(n_splits)]
 
 
+def temporal_split(df, test_frac):
+    """Un solo split DENTRO de cada corrida, respetando el orden del tiempo.
+
+    Para cada corrida, sus ventanas se ordenan por tiempo; el primer
+    (1 - test_frac) va a entrenamiento y el último test_frac a prueba.
+    Ejemplo con ventana de 10 s y una corrida de ~300 s (30 ventanas):
+        ventanas 0–23 (0–240 s)  → entrenamiento
+        ventanas 24–29 (240–300 s) → prueba
+    No se reparte al azar a propósito: dos ventanas vecinas son casi idénticas,
+    y si se mezclan el modelo acierta por memoria. Cortando en el tiempo solo
+    la ventana justo antes del corte y la justo después son "vecinas".
+
+    Devuelve una lista con un solo (índices_entrenamiento, índices_prueba).
+    """
+    idx = np.arange(len(df))
+    is_test = np.zeros(len(df), dtype=bool)
+    for _, g in df.groupby("pid", sort=False):
+        order = g.sort_values("window").index.to_numpy()
+        pos = df.index.get_indexer(order)
+        n_test = max(1, int(round(len(pos) * test_frac)))
+        is_test[pos[-n_test:]] = True
+    return [(idx[~is_test], idx[is_test])]
+
+
 def check_folds(splits, y, classes):
     """Verificación de seguridad: avisa si alguna clase falta en el entrenamiento
     o en la prueba de algún pliegue (el síntoma sería recall = 0.000 en esa clase)."""
@@ -608,21 +649,33 @@ def rf_eval(df, name, prefix, md):
     md.append(f"## Features: {name}\n")
     md.append(f"- Features de entrada: {len(feats)} (sin escalar y sin PCA)")
 
-    # --- Paso 2: pliegues agrupados por corrida ---
-    n_splits, runs = make_group_cv(df, N_SPLITS)
-    if n_splits is None:
-        msg = (f"_Alguna clase tiene solo {runs.min()} corrida(s); se necesitan al menos 2 "
-               "por clase para separar entrenamiento y prueba por corrida._\n")
-        print(msg)
-        md.append(msg)
-        return {"features": name}
-    if SPLIT_MODE == "window":
+    # --- Paso 2: separar entrenamiento y prueba según el modo ---
+    if SPLIT_MODE == "temporal":
+        splits = temporal_split(df.reset_index(drop=True), TEST_FRAC)
+        tr, te = splits[0]
+        pct = int(round((1 - TEST_FRAC) * 100))
+        print(f"Split temporal {pct}/{100 - pct} dentro de cada corrida: "
+              f"{len(tr)} ventanas de entrenamiento, {len(te)} de prueba")
+        md.append(f"- Validación: split temporal {pct}/{100 - pct} DENTRO de cada corrida "
+                  f"(primer {pct} % de las ventanas entrena, último {100 - pct} % prueba); "
+                  f"{len(tr)} ventanas de entrenamiento y {len(te)} de prueba")
+        md.append("- Ojo: entrenamiento y prueba vienen de la misma corrida; no mide "
+                  "generalización a corridas nuevas")
+    elif SPLIT_MODE == "window":
         # Modo diagnóstico: ventanas sueltas, sin respetar la corrida.
         cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
         splits = list(cv.split(X, y))
         md.append(f"- Validación: StratifiedKFold, {N_SPLITS} pliegues por VENTANA "
                   "(diagnóstico: ventanas de una misma corrida en train y test)")
     else:
+        n_splits, runs = make_group_cv(df, N_SPLITS)
+        if n_splits is None:
+            msg = (f"_Alguna clase tiene solo {runs.min()} corrida(s); se necesitan al menos 2 "
+                   "por clase para separar entrenamiento y prueba por corrida. "
+                   "Prueba PCM_SPLIT=temporal._\n")
+            print(msg)
+            md.append(msg)
+            return {"features": name}
         splits = run_folds(y, groups, n_splits)
         md.append(f"- Validación: {n_splits} pliegues por corrida (cada clase tiene "
                   "corridas en entrenamiento y en prueba en todos los pliegues)")
@@ -676,8 +729,10 @@ def rf_eval(df, name, prefix, md):
     md.append("")
 
     result = {"features": name, "n_feat": len(feats)}
-    for m in ["train_acc", "f1_macro", "mal_precision", "mal_recall", "mal_f1"]:
-        result[m] = f"{summary.loc[m, 'mean']:.3f} ± {summary.loc[m, 'std']:.3f}"
+    for m in ["train_acc", "test_acc", "f1_macro", "mal_precision", "mal_recall", "mal_f1"]:
+        mean, std = summary.loc[m, "mean"], summary.loc[m, "std"]
+        # Con un solo split (modo temporal) no hay desviación entre pliegues.
+        result[m] = f"{mean:.3f}" if np.isnan(std) else f"{mean:.3f} ± {std:.3f}"
 
     if best_params:
         md.append("### Mejores hiperparámetros por pliegue (RandomizedSearchCV)\n")
@@ -687,10 +742,14 @@ def rf_eval(df, name, prefix, md):
         pd.DataFrame(best_params).to_csv(OUT / f"{prefix}_rf_best_params.csv", index=False)
 
     # --- Paso 5: matriz de confusión y reporte por clase (out-of-fold) ---
-    cm = confusion_matrix(y, y_pred_oof, labels=range(n))
+    # Solo cuentan las ventanas que sí se usaron como prueba. En los modos "run" y
+    # "window" son todas; en "temporal" solo el último 20 % de cada corrida.
+    tested = y_pred_oof >= 0
+    y_t, pred_t, proba_t, ybin_t = y[tested], y_pred_oof[tested], proba_oof[tested], y_bin[tested]
+    cm = confusion_matrix(y_t, pred_t, labels=range(n))
     plot_confusion(cm, classes, f"Confusion matrix — RF, {name} (out-of-fold)",
                    f"{prefix}_rf_confusionmatrix.png")
-    report = classification_report(y, y_pred_oof, labels=range(n), target_names=classes,
+    report = classification_report(y_t, pred_t, labels=range(n), target_names=classes,
                                    zero_division=0, digits=3)
     print(report)
     md.append("### Reporte por clase (predicciones out-of-fold)\n")
@@ -701,15 +760,15 @@ def rf_eval(df, name, prefix, md):
         md.append("_No hay clases malignas en los datos; se omite el ROC AUC._\n")
         return result
 
-    benign = y_bin == 0
+    benign = ybin_t == 0
     auc_rows = []
     for cname in mal_present:
         num = class_to_num[cname]
-        m = benign | (y == num)   # solo esta familia vs. benignos
-        auc = roc_auc_score((y[m] == num).astype(int), proba_oof[m, num])
+        m = benign | (y_t == num)   # solo esta familia vs. benignos
+        auc = roc_auc_score((y_t[m] == num).astype(int), proba_t[m, num])
         auc_rows.append([f"{cname} vs benignos", auc])
         result[f"AUC {cname}"] = f"{auc:.3f}"
-    auc_all = roc_auc_score(y_bin, proba_oof[:, mal_nums].sum(axis=1))
+    auc_all = roc_auc_score(ybin_t, proba_t[:, mal_nums].sum(axis=1))
     auc_rows.append([f"malignos ({' + '.join(mal_present)}) vs benignos", auc_all])
     result["AUC malignos"] = f"{auc_all:.3f}"
     for label, auc in auc_rows:
@@ -850,12 +909,34 @@ def write_run_summary(raw: pd.DataFrame):
     print(s.drop(columns="run_file").round(3).to_string(index=False))
 
 
+def select_run(raw: pd.DataFrame, k: int) -> pd.DataFrame:
+    """Se queda solo con la k-ésima corrida de cada workload (k = 1 es la primera,
+    en el orden alfabético de los CSV). Si un workload tiene menos de k corridas,
+    se usa su última corrida y se avisa."""
+    keep = []
+    for label, g in raw.groupby("class", sort=False):
+        pids = list(dict.fromkeys(g["pid"]))
+        if len(pids) < k:
+            print(f"[aviso] '{label}' solo tiene {len(pids)} corrida(s); se usa la última")
+        keep.append(pids[min(k, len(pids)) - 1])
+    out = raw[raw["pid"].isin(keep)]
+    files = out.groupby("class", sort=False)["run_file"].first()
+    print(f"Modo temporal: se usa la corrida {k} de cada workload:")
+    for label, f in files.items():
+        print(f"  {label:<11} {f}")
+    return out
+
+
 def main():
     BASE_OUT.mkdir(exist_ok=True)
     print(f"Modo de separación train/test: {SPLIT_MODE}  →  salida en {BASE_OUT}/")
+    if SPLIT_MODE == "temporal":
+        print(f"Prueba = último {TEST_FRAC:.0%} de cada corrida; corrida(s) usada(s): {RUN_CHOICE}")
 
     print("Loading PCM telemetry...")
     raw = load_pcm_dataset(min_samples=int(FS * max(WINDOW_SIZES_S)))
+    if SPLIT_MODE == "temporal" and RUN_CHOICE != "all":
+        raw = select_run(raw, int(RUN_CHOICE))
     write_run_summary(raw)
 
     all_results = []
