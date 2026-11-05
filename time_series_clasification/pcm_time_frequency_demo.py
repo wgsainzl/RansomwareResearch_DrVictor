@@ -79,7 +79,7 @@ WINDOW_SIZES_S = [1, 2, 5, 10, 15, 20]
 WINDOW_S = 20
 WINDOW_N = int(FS * WINDOW_S)
 
-METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI"]
+METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI", "L2_HIT", "L3_HIT"]
 
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
            "sysbench", "mlc", "cryptsky", "ransomware"]
@@ -188,6 +188,9 @@ def load_pcm_csv(path: Path, label: str, run_id: int) -> pd.DataFrame:
         "CPI": 1.0 / ipc.where(ipc > 0),
         "LLC_MPKI": col("L3MISS") / col("INST") * 1000.0,
         "L2_MPKI": col("L2MISS") / col("INST") * 1000.0,
+        "L2_HIT": col("L2HIT"),
+        "L3_HIT": col("L3HIT"),
+
     })
 
     # Interpolar huecos para no romper el espaciado de 0.1 s (importante para la FFT).
