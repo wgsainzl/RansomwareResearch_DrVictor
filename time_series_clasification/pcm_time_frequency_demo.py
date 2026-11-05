@@ -82,9 +82,9 @@ WINDOW_N = int(FS * WINDOW_S)
 METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI", "L2_HIT", "L3_HIT"]
 
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
-           "sysbench", "mlc", "cryptsky", "ransomware"]
+           "sysbench", "mlc", "cryptsky", "ransomware", "trojan", "ransim"]
 
-MALICIOUS = ["cryptsky", "ransomware"]
+MALICIOUS = ["cryptsky", "ransomware", "trojan", "ransim"]
 
 # Columnas que identifican una ventana (NO son features).
 META_COLS = ["pid", "class", "window", "start_s"]
