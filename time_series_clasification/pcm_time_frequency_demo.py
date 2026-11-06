@@ -84,7 +84,7 @@ METRICS = ["CPI", "IPC", "LLC_MPKI", "L2_MPKI", "L2_HIT", "L3_HIT"]
 CLASSES = ["7zip", "ffmpeg", "gpg", "openssl", "readwrite", "rsync", "stress",
            "sysbench", "mlc", "cryptsky", "ransomware", "trojan", "ransim"]
 
-MALICIOUS = ["ransomware", "trojan", "ransim"]
+MALICIOUS = ["cryptsky", "ransomware", "trojan", "ransim"]
 
 # Columnas que identifican una ventana (NO son features).
 META_COLS = ["pid", "class", "window", "start_s"]
@@ -113,8 +113,13 @@ for _c in CLASSES:
 #                   "all" = todas (cada una partida 80/20 por separado).
 TEST_FRAC = float(os.environ.get("PCM_TEST_FRAC", "0.2"))
 RUN_CHOICE = os.environ.get("PCM_RUN", "1")
+#   PCM_TARGET_FPR → tasa de falsas alarmas aceptada al calibrar el umbral de la
+#                    prueba "ransomware nunca visto" (0.01 = 1 % de ventanas benignas).
+TARGET_FPR = float(os.environ.get("PCM_TARGET_FPR", "0.01"))
 if not 0 < TEST_FRAC < 1:
     raise ValueError("PCM_TEST_FRAC debe estar entre 0 y 1")
+if not 0 < TARGET_FPR < 1:
+    raise ValueError("PCM_TARGET_FPR debe estar entre 0 y 1")
 if RUN_CHOICE != "all" and not RUN_CHOICE.isdigit():
     raise ValueError("PCM_RUN debe ser un número (1, 2, ...) o 'all'")
 
@@ -532,6 +537,29 @@ def full_proba(clf, X, n_classes):
     return P
 
 
+def calibrate_threshold(X_tr, yb_tr, g_tr, target_fpr=TARGET_FPR, val_frac=0.25):
+    """Umbral de decisión para el bosque binario (maligno vs. benigno).
+
+    Por defecto un Random Forest marca "maligno" si >= 50 % de los árboles votan
+    maligno (umbral 0.5). Con una familia que el modelo NUNCA vio, los árboles
+    dudan y el voto se reparte (p. ej. 15-30 %): nunca llega a mayoría aunque
+    quede muy por encima de los benignos (que reciben ~0 %).
+
+    Aquí el umbral se elige con datos de ENTRENAMIENTO, sin tocar la prueba:
+      1. Las ventanas de entrenamiento se cortan otra vez en el tiempo:
+         inicio (75 %) → entrena un bosque auxiliar; final (25 %) → validación.
+      2. Se calculan los scores de las ventanas BENIGNAS de validación.
+      3. El umbral es el percentil (1 - target_fpr) de esos scores: con
+         target_fpr = 0.01, solo el 1 % de las ventanas benignas lo supera.
+    Devuelve el umbral (float).
+    """
+    fit_idx, val_idx = inner_temporal_split(g_tr, val_frac)[0]
+    clf_v, _ = build_model(X_tr[fit_idx], yb_tr[fit_idx], g_tr[fit_idx])
+    s_val = full_proba(clf_v, X_tr[val_idx], 2)[:, 1]
+    s_ben = s_val[yb_tr[val_idx] == 0]
+    return float(np.quantile(s_ben, 1 - target_fpr))
+
+
 def plot_confusion(cm, classes, title, fname):
     """Matriz de confusión: filas = clase real, columnas = clase predicha."""
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -700,6 +728,8 @@ def rf_eval(df, name, prefix, md):
     # el 20 % final de esa familia + el 20 % final de los benignos.
     #   detección = % de ventanas de la familia nueva marcadas como malignas
     #   FPR       = % de ventanas benignas marcadas como malignas (falsas alarmas)
+    # Se reporta con dos umbrales: 0.5 (mayoría de árboles, el de sklearn) y uno
+    # calibrado con calibrate_threshold() para un FPR objetivo de TARGET_FPR.
     if len(mal_present) >= 2:
         lofo_rows = []
         for cname in mal_present:
@@ -707,18 +737,27 @@ def rf_eval(df, name, prefix, md):
             tr_f = tr[y[tr] != num]                        # el modelo NUNCA ve esta familia
             te_f = te[(y_bin[te] == 0) | (y[te] == num)]   # prueba: benignos + familia nueva
             clf_f, _ = build_model(X[tr_f], y_bin[tr_f], groups[tr_f])
+            thr = calibrate_threshold(X[tr_f], y_bin[tr_f], groups[tr_f])
             score = full_proba(clf_f, X[te_f], 2)[:, 1]
             yt = (y[te_f] == num).astype(int)
-            pred = (score >= 0.5).astype(int)
-            det = recall_score(yt, pred, zero_division=0)
-            fpr = pred[yt == 0].mean()
+            pred05 = (score >= 0.5).astype(int)
+            pred_cal = (score > thr).astype(int)
+            det05 = recall_score(yt, pred05, zero_division=0)
+            fpr05 = pred05[yt == 0].mean()
+            det_cal = recall_score(yt, pred_cal, zero_division=0)
+            fpr_cal = pred_cal[yt == 0].mean()
             auc = roc_auc_score(yt, score)
-            lofo_rows.append([cname, det, fpr, auc])
-            result[f"det. {cname} no visto"] = f"{det:.3f}"
-            print(f"{cname} nunca visto → detección {det:.3f}, FPR {fpr:.3f}, AUC {auc:.3f}")
+            lofo_rows.append([cname, det05, fpr05, thr, det_cal, fpr_cal, auc])
+            result[f"det. {cname} no visto"] = f"{det05:.3f}"
+            result[f"det. {cname} no visto (cal)"] = f"{det_cal:.3f}"
+            print(f"{cname} nunca visto → umbral 0.5: detección {det05:.3f}, FPR {fpr05:.3f} | "
+                  f"umbral {thr:.3f}: detección {det_cal:.3f}, FPR {fpr_cal:.3f} | AUC {auc:.3f}")
         md.append("### Generalización: ransomware nunca visto en entrenamiento\n")
-        md.append("Bosque binario (maligno vs. benigno) entrenado SIN la familia indicada.\n")
-        md.append(md_table(["Familia excluida", "Detección (recall)", "FPR benignos", "AUC"],
+        md.append("Bosque binario (maligno vs. benigno) entrenado SIN la familia indicada. "
+                  f"El umbral calibrado se elige en validación (final del entrenamiento) para "
+                  f"un FPR objetivo de {TARGET_FPR:.0%}; el FPR de la tabla es el medido en prueba.\n")
+        md.append(md_table(["Familia excluida", "Detección (0.5)", "FPR (0.5)",
+                            "Umbral calibrado", "Detección (cal)", "FPR (cal)", "AUC"],
                            lofo_rows))
         md.append("")
 
@@ -757,7 +796,8 @@ def run_window(raw: pd.DataFrame, window_s: int):
         f"- Datos: `{DATA_DIR}`",
         f"- Ventana: {WINDOW_S} s ({WINDOW_N} muestras a {FS:g} Hz)",
         f"- Métricas: {', '.join(METRICS)}",
-        f"- Clases malignas: {', '.join(MALICIOUS)}\n",
+        f"- Clases malignas: {', '.join(MALICIOUS)}",
+        f"- FPR objetivo del umbral calibrado: {TARGET_FPR:.0%}\n",
         "### Ventanas por clase\n",
         md_table(["Clase", "Tipo", "Corridas", "Ventanas"],
                  [[c, "maligna" if c in MALICIOUS else "benigna",
