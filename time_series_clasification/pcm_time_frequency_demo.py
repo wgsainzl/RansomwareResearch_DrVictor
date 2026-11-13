@@ -12,7 +12,7 @@ Classifier in Python" (Eden Molina, TDS, 2021), adaptados a series de tiempo.
 -----------------------------------------
 1. LEE los CSV de Intel PCM para cada aplicación (7zip, ffmpeg, ..., cryptsky,
    ransomware) y se queda con UNA corrida de cada una (PCM_RUN, por defecto la 1).
-2. CALCULA 4 métricas por muestra: CPI, IPC, LLC_MPKI y L2_MPKI.
+2. CALCULA 6 métricas por muestra: CPI, IPC, LLC_MPKI, L2_MPKI, L2_HIT y L3_HIT.
 3. CORTA cada corrida en VENTANAS de 1, 2, 5, 10, 15 y 20 segundos.
 4. Para cada ventana EXTRAE features (tiempo, frecuencia FFT e híbrido).
 5. SEPARA en el tiempo, dentro de cada corrida: el primer 80 % de las ventanas
@@ -22,11 +22,14 @@ Classifier in Python" (Eden Molina, TDS, 2021), adaptados a series de tiempo.
    recall, F1 (por clase y maligno vs. benigno), ROC AUC, sobreajuste
    (train vs. test), importancia de features y una prueba de generalización:
    ¿detecta un ransomware que NUNCA vio al entrenar?
+7. GRAFICA las 6 métricas por pares (15 pares, un color por workload) y ordena
+   los pares según qué tan bien agrupan a todos los malignos (11_*, 12_*).
    Todo se guarda en ./pcm_rf_output_temporal_run1/window_XXs/ y la tabla
    comparativa en ./pcm_rf_output_temporal_run1/stats_all_windows.md
 
 Dependencias:
     pip install numpy pandas matplotlib scikit-learn scipy
+    pip install adjustText      # opcional: acomoda los nombres en las gráficas por pares
 
 Ejecutar:
     python pcm_time_frequency_rf.py                     # corrida 1, split 80/20
@@ -54,7 +57,16 @@ from sklearn.decomposition import PCA              # solo para la gráfica PCA d
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import (confusion_matrix, precision_score, recall_score, f1_score,
-                             accuracy_score, roc_auc_score, classification_report)
+                             accuracy_score, roc_auc_score, classification_report,
+                             balanced_accuracy_score, silhouette_score)
+from sklearn.neighbors import NearestNeighbors     # solo para medir traslape en las gráficas por pares
+from itertools import combinations
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
+
+try:   # opcional (pip install adjustText): evita que se encimen los nombres de las clases
+    from adjustText import adjust_text
+except ImportError:
+    adjust_text = None
 
 
 # Generador de números aleatorios con semilla fija → resultados reproducibles.
@@ -99,6 +111,12 @@ for _c in CLASSES:
     else:
         _i = len([k for k in COLORS if k not in MALICIOUS])
         COLORS[_c] = _BENIGN_PALETTE[_i % len(_BENIGN_PALETTE)]
+
+# Marcador por clase maligna en las gráficas por pares: rojo y rojo oscuro se
+# confunden, así que cada familia lleva además su propia forma.
+_MAL_MARKERS = ["X", "P", "^", "D"]
+MARKERS = {c: (_MAL_MARKERS[MALICIOUS.index(c) % len(_MAL_MARKERS)] if c in MALICIOUS else "o")
+           for c in CLASSES}
 
 # ---------------------------------------------------------------------
 # Separación entrenamiento / prueba: split TEMPORAL dentro de cada corrida
@@ -434,6 +452,253 @@ def pca_plot(df, title, filename):
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1))
     ax.grid(alpha=0.25)
     savefig(filename)
+
+
+# ---------------------------------------------------------------------
+# Gráficas por pares de métricas (11 y 12)
+# ---------------------------------------------------------------------
+# Objetivo: buscar un par de métricas en el que TODOS los malignos queden
+# agrupados (juntos entre sí y lejos de los benignos). Cada punto es una ventana
+# (la media de la métrica en la ventana, igual que las features *_mean).
+#
+# Escalas: las MPKI van de ~0.005 (cryptsky) a ~25 (mlc); en lineal todo queda
+# aplastado contra el cero. "symlog" es logarítmica pero admite el 0 (LLC_MPKI
+# tiene muestras en 0).
+PAIR_SCALES = {
+    "CPI": ("log", {}),
+    "IPC": ("linear", {}),
+    "LLC_MPKI": ("symlog", {"linthresh": 0.01}),
+    "L2_MPKI": ("symlog", {"linthresh": 0.01}),
+    "L2_HIT": ("linear", {}),
+    "L3_HIT": ("linear", {}),
+}
+PAIR_LABELS = {"CPI": "CPI", "IPC": "IPC", "LLC_MPKI": "LLC MPKI",
+               "L2_MPKI": "L2 MPKI", "L2_HIT": "L2 hit ratio", "L3_HIT": "L3 hit ratio"}
+# Métricas que se pasan a log10 antes de medir distancias (vecinos más cercanos).
+_LOG_METRICS = {"CPI", "LLC_MPKI", "L2_MPKI"}
+
+
+def _tick_fmt(v, _pos=None):
+    return "0" if v == 0 else f"{v:g}"
+
+
+def _set_pair_scale(ax, which, metric):
+    """Aplica la escala de la métrica a un eje ('x' o 'y') con ticks legibles."""
+    scale, kw = PAIR_SCALES[metric]
+    axis = ax.xaxis if which == "x" else ax.yaxis
+    (ax.set_xscale if which == "x" else ax.set_yscale)(scale, **kw)
+    if scale == "symlog":
+        if which == "x":
+            ax.set_xlim(left=0)          # las MPKI nunca son negativas
+        else:
+            ax.set_ylim(bottom=0)
+        axis.set_major_locator(FixedLocator([0, 0.01, 0.1, 1, 10, 100]))
+    elif scale == "log":
+        axis.set_major_locator(FixedLocator([0.3, 0.5, 1, 2, 5, 10]))
+    if scale != "linear":
+        axis.set_minor_locator(NullLocator())
+        axis.set_major_formatter(FuncFormatter(_tick_fmt))
+
+
+def _pair_scatter(ax, w, x, y, small=False):
+    """Dispersión de un par: un color por workload; malignos con su propio marcador."""
+    for label in CLASSES:
+        d = w[w["class"] == label]
+        if d.empty:
+            continue
+        mal = label in MALICIOUS
+        ax.scatter(d[x], d[y], color=COLORS[label], marker=MARKERS[label],
+                   s=(14 if small else 40) if mal else (4 if small else 12),
+                   alpha=0.85 if mal else 0.45, linewidths=0.4 if mal else 0,
+                   edgecolors="white" if mal else "none",
+                   zorder=3 if mal else 2, label=label, rasterized=True)
+    _set_pair_scale(ax, "x", x)
+    _set_pair_scale(ax, "y", y)
+    ax.grid(alpha=0.25)
+
+
+def _class_legend_handles():
+    return [plt.Line2D([], [], ls="", marker=MARKERS[c], color=COLORS[c],
+                       markersize=8 if c in MALICIOUS else 6,
+                       label=c + (" (maligno)" if c in MALICIOUS else ""))
+            for c in CLASSES]
+
+
+def pair_separability(w: pd.DataFrame) -> pd.DataFrame:
+    """¿En qué par de métricas quedan TODOS los malignos agrupados?
+
+    Para cada par (2 features: las medias de la ventana) se mide:
+      silhouette    → silhouette de las etiquetas maligno/benigno (-1 a 1). Cerca
+                      de 1 = los malignos forman un grupo compacto y separado;
+                      cerca de 0 = se enciman con los benignos.
+      radio_mal     → distancia de la familia maligna más alejada al centro de
+                      los malignos (en z-score). Chico = las familias están juntas.
+      benigno_mas_cerca / dist_benigno → el benigno cuya mediana queda más cerca
+                      de la mediana de alguna familia maligna (quién "invade").
+      det_no_visto  → detección promedio de una familia maligna que el bosque
+                      NUNCA vio (umbral 0.5). Si los malignos forman un grupo, la
+                      familia nueva cae junto a las otras y se detecta.
+      mal_mezclado  → % de ventanas malignas cuyos 10 vecinos más cercanos son en
+                      su mayoría benignos.
+      bal_acc       → bosque binario (maligno vs. benigno) con el mismo split
+                      temporal 80/20; exactitud balanceada en prueba.
+    Las distancias usan log10 en CPI/MPKI y luego z-score.
+    """
+    w = w.reset_index(drop=True)
+    cls = w["class"].to_numpy()
+    yb = np.isin(cls, MALICIOUS).astype(int)
+    mal_present = [c for c in MALICIOUS if c in set(cls)]
+    tr, te = temporal_split(w, TEST_FRAC)
+    is_tr = np.zeros(len(w), bool)
+    is_tr[tr] = True
+    # Escala común para las distancias: log10 en CPI/MPKI y luego z-score.
+    Z_all = pd.DataFrame({m: np.log10(w[m] + 1e-3) if m in _LOG_METRICS else w[m]
+                          for m in METRICS})
+    Z_all = (Z_all - Z_all.mean()) / Z_all.std()
+    params = {**RF_PARAMS, "n_estimators": 100}   # 100 árboles bastan para 2 features
+    rows = []
+    for x, y in combinations(METRICS, 2):
+        X = w[[x, y]].to_numpy()
+        row = {"par": f"{y} vs {x}"}
+        clf = RandomForestClassifier(**params).fit(X[tr], yb[tr])
+        row["bal_acc"] = balanced_accuracy_score(yb[te], clf.predict(X[te]))
+        dets = []
+        for fam in mal_present:
+            tr_f = is_tr & (cls != fam)
+            te_f = ~is_tr & ((yb == 0) | (cls == fam))
+            clf_f = RandomForestClassifier(**params).fit(X[tr_f], yb[tr_f])
+            det = recall_score((cls[te_f] == fam).astype(int), clf_f.predict(X[te_f]),
+                               zero_division=0)
+            row[f"det {fam} no visto"] = det
+            dets.append(det)
+        row["det_no_visto"] = float(np.mean(dets)) if dets else np.nan
+        Z = Z_all[[x, y]].to_numpy()
+        k = min(10, len(Z) - 1)
+        _, ix = NearestNeighbors(n_neighbors=k + 1).fit(Z).kneighbors(Z[yb == 1])
+        row["mal_mezclado"] = float((yb[ix[:, 1:]].mean(axis=1) < 0.5).mean())
+        row["silhouette"] = float(silhouette_score(Z, yb, sample_size=min(2000, len(Z)),
+                                                   random_state=42))
+        med = pd.DataFrame(Z, columns=["a", "b"]).groupby(cls).median()
+        center = med.loc[mal_present].to_numpy().mean(axis=0)
+        row["radio_mal"] = float(np.linalg.norm(med.loc[mal_present].to_numpy() - center,
+                                                axis=1).max())
+        # Benigno más cercano a CUALQUIER familia maligna (no al centro: cryptsky
+        # jala el centro hacia una zona vacía).
+        ben = med.drop(index=mal_present)
+        mal_med = med.loc[mal_present].to_numpy()
+        dist = pd.Series(np.linalg.norm(ben.to_numpy()[:, None, :] - mal_med[None, :, :],
+                                        axis=2).min(axis=1), index=ben.index)
+        row["benigno_mas_cerca"] = dist.idxmin()
+        row["dist_benigno"] = float(dist.min())
+        rows.append(row)
+    cols = ["par", "silhouette", "radio_mal", "benigno_mas_cerca", "dist_benigno",
+            "det_no_visto", "mal_mezclado", "bal_acc"] + \
+           [f"det {f} no visto" for f in mal_present]
+    return pd.DataFrame(rows)[cols].sort_values("silhouette", ascending=False)
+
+
+def plot_metric_pairs(time_df: pd.DataFrame) -> list:
+    """11 y 12: las 6 métricas comparadas por pares (15 pares), un color por workload.
+
+      11_pairs_grid.png       matriz 6x6: dispersión de cada par, distribución de
+                              cada métrica en la diagonal y ρ de Spearman arriba.
+      12_pairs/<y>_vs_<x>.png un archivo por par, con el nombre de cada workload
+                              en su mediana.
+      12_pairs_separability.csv  ranking de pares (ver pair_separability()).
+    Devuelve líneas de Markdown para stats.md.
+    """
+    w = time_df[META_COLS].copy()
+    for m in METRICS:
+        w[m] = time_df[f"{m}_mean"]
+    pairs = list(combinations(METRICS, 2))
+    k = len(METRICS)
+    rho = w[METRICS].corr(method="spearman")
+
+    # --- 11: matriz 6x6 ---
+    fig, axes = plt.subplots(k, k, figsize=(18, 16))
+    for i, yname in enumerate(METRICS):
+        for j, xname in enumerate(METRICS):
+            ax = axes[i, j]
+            if j > i:                      # triángulo superior: correlación
+                ax.axis("off")
+                ax.text(0.5, 0.55, f"ρ = {rho.loc[yname, xname]:+.2f}", ha="center",
+                        va="center", fontsize=14, transform=ax.transAxes)
+                ax.text(0.5, 0.36, f"{PAIR_LABELS[yname]} · {PAIR_LABELS[xname]}",
+                        ha="center", va="center", fontsize=8, color="0.35",
+                        transform=ax.transAxes)
+                continue
+            if i == j:                     # diagonal: distribución por workload
+                vals = w[xname]
+                scale = PAIR_SCALES[xname][0]
+                if scale == "log":
+                    bins = np.logspace(np.log10(max(vals.min(), 1e-3)), np.log10(vals.max()), 40)
+                elif scale == "symlog":
+                    bins = np.concatenate([np.linspace(0, 0.01, 5)[:-1],
+                                           np.logspace(-2, np.log10(max(vals.max(), 0.02)), 36)])
+                else:
+                    bins = np.linspace(vals.min(), vals.max(), 40)
+                for label in CLASSES:
+                    d = w.loc[w["class"] == label, xname]
+                    if not d.empty:
+                        ax.hist(d, bins=bins, histtype="step", color=COLORS[label],
+                                linewidth=1.6 if label in MALICIOUS else 1.0)
+                _set_pair_scale(ax, "x", xname)
+                ax.set_yticks([])
+            else:
+                _pair_scatter(ax, w, xname, yname, small=True)
+            ax.tick_params(labelsize=7)
+            if i == k - 1:
+                ax.set_xlabel(PAIR_LABELS[xname])
+            if j == 0 and i != 0:
+                ax.set_ylabel(PAIR_LABELS[yname])
+    fig.legend(handles=_class_legend_handles(), loc="center left",
+               bbox_to_anchor=(1.0, 0.5), frameon=False)
+    fig.suptitle(f"PCM metrics, pairwise ({WINDOW_S}-second window means)", fontsize=15)
+    savefig("11_pairs_grid.png")
+
+    # --- 12: un archivo por par, con etiquetas en la mediana de cada workload ---
+    pair_dir = OUT / "12_pairs"
+    pair_dir.mkdir(exist_ok=True)
+    med = w.groupby("class")[METRICS].median()
+    for x, y in pairs:
+        fig, ax = plt.subplots(figsize=(9, 7))
+        _pair_scatter(ax, w, x, y)
+        texts = [ax.text(med.loc[c, x], med.loc[c, y], c, fontsize=8,
+                         fontweight="bold" if c in MALICIOUS else "normal",
+                         color=COLORS[c], zorder=5,
+                         bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7))
+                 for c in CLASSES if c in med.index]
+        if adjust_text is not None:
+            adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color="0.4", lw=0.5))
+        ax.set_xlabel(PAIR_LABELS[x])
+        ax.set_ylabel(PAIR_LABELS[y])
+        ax.set_title(f"{PAIR_LABELS[y]} vs {PAIR_LABELS[x]} — {WINDOW_S}-second window means")
+        ax.legend(handles=_class_legend_handles(), loc="upper left",
+                  bbox_to_anchor=(1.01, 1), frameon=False, fontsize=8)
+        plt.tight_layout()
+        plt.savefig(pair_dir / f"{y}_vs_{x}.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+    # --- Ranking: ¿algún par agrupa a todos los malignos? ---
+    print("Pairwise separability...")
+    sep = pair_separability(w)
+    sep.to_csv(OUT / "12_pairs_separability.csv", index=False)
+    rho.round(3).to_csv(OUT / "11_pairs_spearman.csv")
+    print(sep.round(3).to_string(index=False))
+    return [
+        "## Pares de métricas: ¿algún par agrupa a todos los malignos?\n",
+        "Cada par usa solo 2 features (las medias de la ventana). Ordenado por "
+        "`silhouette` maligno vs. benigno (1 = malignos en un grupo compacto y aparte; "
+        "0 = encimados con benignos). `radio_mal` = distancia de la familia maligna más "
+        "alejada al centro maligno (z-score; chico = familias juntas). "
+        "`benigno_mas_cerca` / `dist_benigno` = benigno más cercano a alguna familia maligna. "
+        "`det_no_visto` = detección promedio de una familia que el bosque nunca vio "
+        "(si los malignos forman grupo, cae junto a las otras). `mal_mezclado` = % de "
+        "ventanas malignas cuyos 10 vecinos son mayormente benignos. Gráficas en "
+        "`11_pairs_grid.png` y `12_pairs/`.\n",
+        md_table(list(sep.columns), sep.values.tolist()),
+        "",
+    ]
 
 
 def md_table(header, rows) -> str:
@@ -787,6 +1052,7 @@ def run_window(raw: pd.DataFrame, window_s: int):
     plot_fft_examples(raw)
     pca_plot(time_df, "PCA (visualization only) — time-domain features",
              "07_pca_time_domain.png")
+    pair_md = plot_metric_pairs(time_df)
 
     print("Random Forest...")
     counts = time_df["class"].value_counts()
@@ -816,6 +1082,7 @@ def run_window(raw: pd.DataFrame, window_s: int):
     md.append("## Comparación entre familias de features\n")
     md.append(md_table(cols, [[r.get(c, "") for c in cols] for r in results]))
     md.append("")
+    md.extend(pair_md)
 
     (OUT / "stats.md").write_text("\n".join(md), encoding="utf-8")
     print(f"Estadísticas guardadas en {OUT / 'stats.md'}")
